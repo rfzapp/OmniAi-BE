@@ -1,0 +1,44 @@
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import morgan from "morgan";
+import compression from "compression";
+import cookieParser from "cookie-parser";
+import { env, isProduction } from "./config/env";
+import { notFoundMiddleware } from "./middlewares/notFound.middleware";
+import { errorMiddleware } from "./middlewares/error.middleware";
+import authRoutes from "./modules/auth/auth.routes";
+import userRoutes from "./modules/user/user.routes";
+import aiRoutes from "./modules/ai/ai.routes";
+import conversationRoutes from "./modules/conversation/conversation.routes";
+import settingsRoutes from "./modules/settings/settings.routes";
+
+const app = express();
+
+app.use(helmet());
+app.use(
+  cors({
+    origin: env.FRONTEND_URL,
+    credentials: true,
+  }),
+);
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+app.use(cookieParser());
+app.use(compression());
+app.use(morgan(isProduction ? "combined" : "dev"));
+
+app.get("/api/health", (_req, res) => {
+  res.status(200).json({ success: true, message: "OmniAI backend is running", data: null });
+});
+
+app.use("/api/auth", authRoutes);
+app.use("/api/user", userRoutes);
+app.use("/api/ai", aiRoutes);
+app.use("/api/conversations", conversationRoutes);
+app.use("/api/settings", settingsRoutes);
+
+app.use(notFoundMiddleware);
+app.use(errorMiddleware);
+
+export default app;
