@@ -14,7 +14,7 @@ function refreshCookieOptions(): CookieOptions {
     secure: isProduction,
     sameSite: isProduction ? "none" : "lax",
     maxAge: parseDurationToMs(env.JWT_REFRESH_EXPIRES_IN),
-    path: "/api/auth",
+    path: "/",
   };
 }
 
@@ -31,7 +31,7 @@ export async function loginHandler(req: Request, res: Response) {
 }
 
 export async function logoutHandler(_req: Request, res: Response) {
-  res.clearCookie(REFRESH_COOKIE_NAME, { path: "/api/auth" });
+  res.clearCookie(REFRESH_COOKIE_NAME, { path: "/" });
   sendSuccess(res, 200, "Logout successful");
 }
 
