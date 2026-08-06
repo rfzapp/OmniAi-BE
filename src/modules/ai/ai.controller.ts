@@ -20,6 +20,7 @@ export async function chatHandler(req: Request, res: Response) {
       id: message.id,
       role: message.role,
       content: message.content,
+      model: message.model,
       createdAt: message.createdAt,
     },
     usage,
