@@ -6,5 +6,6 @@ export interface ProviderChatMessage {
 }
 
 export interface AIProvider {
-  generateReply(model: string, messages: ProviderChatMessage[]): Promise<string>;
+  /** apiKeyOverride: when set (BYOK), use the caller's own key instead of the platform's shared one. */
+  generateReply(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string): Promise<string>;
 }

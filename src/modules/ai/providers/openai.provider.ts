@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { openaiClient } from "../../../config/openai";
+import { getOpenAIClient } from "../../../config/openai";
 import { ApiError } from "../../../utils/ApiError";
 import type { AIProvider, ProviderChatMessage } from "./provider.types";
 
@@ -9,9 +9,10 @@ function toOpenAIMessages(messages: ProviderChatMessage[]): ChatCompletionMessag
 }
 
 export const openaiProvider: AIProvider = {
-  async generateReply(model, messages) {
+  async generateReply(model, messages, apiKeyOverride) {
     try {
-      const completion = await openaiClient.chat.completions.create({
+      const client = getOpenAIClient(apiKeyOverride);
+      const completion = await client.chat.completions.create({
         model,
         messages: toOpenAIMessages(messages),
       });

@@ -21,13 +21,13 @@ function refreshCookieOptions(): CookieOptions {
 export async function registerHandler(req: Request, res: Response) {
   const { user, accessToken, refreshToken } = await authService.register(req.body);
   res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
-  sendSuccess(res, 201, "Registration successful", { user, accessToken });
+  sendSuccess(res, 201, "Registration successful", { user, accessToken, refreshToken });
 }
 
 export async function loginHandler(req: Request, res: Response) {
   const { user, accessToken, refreshToken } = await authService.login(req.body);
   res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
-  sendSuccess(res, 200, "Login successful", { user, accessToken });
+  sendSuccess(res, 200, "Login successful", { user, accessToken, refreshToken });
 }
 
 export async function logoutHandler(_req: Request, res: Response) {
@@ -42,10 +42,10 @@ export async function meHandler(req: Request, res: Response) {
 }
 
 export async function refreshHandler(req: Request, res: Response) {
-  const token = req.cookies?.[REFRESH_COOKIE_NAME] as string | undefined;
+  const token = (req.cookies?.[REFRESH_COOKIE_NAME] ?? req.body?.refreshToken) as string | undefined;
   if (!token) throw ApiError.unauthorized("Refresh token missing");
 
   const { accessToken, refreshToken } = await authService.refresh(token);
   res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
-  sendSuccess(res, 200, "Token refreshed successfully", { accessToken });
+  sendSuccess(res, 200, "Token refreshed successfully", { accessToken, refreshToken });
 }
