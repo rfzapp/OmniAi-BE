@@ -90,7 +90,9 @@ export async function chat(userId: string, input: ChatInput) {
 
   return {
     conversation,
-    message: assistantMessage,
+    // Return plaintext content — the stored version is encrypted at rest.
+    // The controller sends this directly to the frontend.
+    message: { ...assistantMessage.toJSON(), content: replyText },
     imageUrl,
     usage: {
       promptsUsed,
