@@ -32,8 +32,14 @@ export async function findOrCreateConversation(userId: string, model: string, fi
   return Conversation.create({ userId, model, title: buildTitle(firstMessage) });
 }
 
-export async function appendMessage(conversationId: string, role: MessageRole, content: string, model?: string) {
-  return Message.create({ conversationId, role, content, ...(model !== undefined && { model }) });
+export async function appendMessage(conversationId: string, role: MessageRole, content: string, model?: string, imageUrl?: string) {
+  return Message.create({
+    conversationId,
+    role,
+    content,
+    ...(model !== undefined && { model }),
+    ...(imageUrl !== undefined && { imageUrl }),
+  });
 }
 
 export async function getRecentMessages(conversationId: string, limit: number) {

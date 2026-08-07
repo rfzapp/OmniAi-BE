@@ -20,6 +20,9 @@ const messageSchema = new Schema(
     model: {
       type: String,
     },
+    imageUrl: {
+      type: String,
+    },
   },
   { timestamps: { createdAt: true, updatedAt: false } },
 );

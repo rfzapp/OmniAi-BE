@@ -1,6 +1,6 @@
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import bcrypt from "bcrypt";
-import type { AuthProvider, SubscriptionPlan, UserRole } from "../../types";
+import type { AuthProvider, ImagePlan, SubscriptionPlan, UserRole } from "../../types";
 
 export interface INotificationPrefs {
   emailUpdates: boolean;
@@ -42,6 +42,7 @@ export interface IUser {
   provider: AuthProvider;
   role: UserRole;
   subscription: SubscriptionPlan;
+  imagePlan: ImagePlan;
   promptCount: number;
   emailVerified: boolean;
   preferences: {
@@ -99,6 +100,11 @@ const userSchema = new Schema<IUser, UserModel, IUserMethods>(
       type: String,
       enum: ["free", "pro", "enterprise"],
       default: "free",
+    },
+    imagePlan: {
+      type: String,
+      enum: ["none", "basic", "pro"],
+      default: "none",
     },
     promptCount: {
       type: Number,
