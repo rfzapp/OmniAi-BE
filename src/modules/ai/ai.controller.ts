@@ -6,7 +6,8 @@ import * as aiService from "./ai.service";
 export async function chatHandler(req: Request, res: Response) {
   if (!req.user) throw ApiError.unauthorized();
 
-  const { conversation, message, imageUrl, usage } = await aiService.chat(req.user.id, req.body);
+  const files = Array.isArray(req.files) ? req.files : [];
+  const { conversation, message, imageUrl, usage } = await aiService.chat(req.user.id, req.body, files as Express.Multer.File[]);
 
   sendSuccess(res, 200, "AI response generated successfully", {
     conversation: {

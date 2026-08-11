@@ -1,6 +1,6 @@
 export type UserRole = "user" | "admin";
 export type AuthProvider = "local" | "google" | "github";
-export type SubscriptionPlan = "free" | "pro" | "enterprise";
+export type SubscriptionPlan = "free" | "standard" | "pro" | "ultra_pro";
 export type ImagePlan = "none" | "basic" | "pro";
 export type MessageRole = "user" | "assistant" | "system";
 

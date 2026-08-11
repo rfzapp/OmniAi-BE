@@ -1,8 +1,23 @@
 import type { MessageRole } from "../../../types";
 
+export interface ProviderContentTextPart {
+  type: "text";
+  text: string;
+}
+
+export interface ProviderContentImagePart {
+  type: "image_url";
+  image_url: {
+    url: string;
+    detail?: "auto" | "low" | "high";
+  };
+}
+
+export type ProviderContentPart = ProviderContentTextPart | ProviderContentImagePart;
+
 export interface ProviderChatMessage {
   role: MessageRole;
-  content: string;
+  content: string | ProviderContentPart[];
 }
 
 export interface AIProvider {

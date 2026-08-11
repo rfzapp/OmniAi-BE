@@ -2,10 +2,32 @@ import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { getOpenAIClient } from "../../../config/openai";
 import { ApiError } from "../../../utils/ApiError";
-import type { AIProvider, ProviderChatMessage } from "./provider.types";
+import type { AIProvider, ProviderChatMessage, ProviderContentPart } from "./provider.types";
 
 function toOpenAIMessages(messages: ProviderChatMessage[]): ChatCompletionMessageParam[] {
-  return messages.map((m) => ({ role: m.role, content: m.content }) as ChatCompletionMessageParam);
+  return messages.map((m) => {
+    const content = m.content;
+
+    if (typeof content === "string") {
+      return { role: m.role, content } as ChatCompletionMessageParam;
+    }
+
+    const parts = content.map((part: ProviderContentPart) => {
+      if (part.type === "text") {
+        return { type: "text" as const, text: part.text };
+      }
+
+      return {
+        type: "image_url" as const,
+        image_url: {
+          url: part.image_url.url,
+          detail: part.image_url.detail,
+        },
+      };
+    });
+
+    return { role: m.role, content: parts } as ChatCompletionMessageParam;
+  });
 }
 
 export const openaiProvider: AIProvider = {

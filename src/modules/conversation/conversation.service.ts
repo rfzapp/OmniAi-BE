@@ -8,6 +8,7 @@ const TITLE_MAX_LENGTH = 60;
 
 function buildTitle(firstMessage: string): string {
   const trimmed = firstMessage.trim();
+  if (!trimmed) return "Attachment chat";
   return trimmed.length > TITLE_MAX_LENGTH ? `${trimmed.slice(0, TITLE_MAX_LENGTH)}…` : trimmed;
 }
 
