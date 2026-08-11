@@ -9,11 +9,9 @@ import { getOpenAIClient } from "../../config/openai";
 import { supportsVision } from "../../config/capabilities";
 import type { ChatInput } from "./ai.validation";
 import type { ProviderChatMessage } from "./providers/provider.types";
+
 const HISTORY_LIMIT = 20;
 const BYOK_PROVIDER = "OpenAI";
-const { PDFParse } = require("pdf-parse");
-const mammoth = require("mammoth");
-const XLSX = require("xlsx");
 
 // Keywords that indicate the user wants an image generated.
 const IMAGE_INTENT_PATTERNS = [
@@ -27,23 +25,28 @@ function isImageRequest(message: string): boolean {
 }
 
 async function extractPdfText(buffer: Buffer): Promise<string> {
-  const parser = new PDFParse({ data: buffer });
-  const result = await parser.getText();
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const pdfParse = require("pdf-parse") as (buffer: Buffer) => Promise<{ text: string }>;
+  const result = await pdfParse(buffer);
   return result.text?.trim() || "";
 }
 
 async function extractDocxText(buffer: Buffer): Promise<string> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const mammoth = require("mammoth") as { extractRawText: (opts: { buffer: Buffer }) => Promise<{ value: string }> };
   const result = await mammoth.extractRawText({ buffer });
   return result.value?.trim() || "";
 }
 
 function extractXlsxText(buffer: Buffer): string {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const XLSX = require("xlsx") as typeof import("xlsx");
   const workbook = XLSX.read(buffer, { type: "buffer" });
   const rows: string[] = [];
 
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName];
-    const data = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+    const data = XLSX.utils.sheet_to_json(sheet!, { defval: "", raw: false });
     rows.push(`Worksheet: ${sheetName}`);
     rows.push(JSON.stringify(data).slice(0, 8000));
   }
