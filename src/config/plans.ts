@@ -8,33 +8,29 @@ export const PROMPT_LIMITS: Record<SubscriptionPlan, number | null> = {
   ultra_pro: 1500,
 };
 
-/** Image generation limits per image plan. `null` means unlimited. */
-export const IMAGE_LIMITS: Record<ImagePlan, number | null> = {
+/** Daily image generation limits per image plan. */
+export const IMAGE_LIMITS: Record<ImagePlan, number> = {
   none: 0,
-  basic: 50,   // 50 images/month
-  pro: null,   // unlimited
-};
-
-/** File attachment limits per 24 hours. */
-export const ATTACHMENT_LIMITS: Record<SubscriptionPlan, number> = {
-  free: 0,
-  standard: 3,
-  pro: 15,
-  ultra_pro: 45,
+  basic: 3,        // $50/mo — 3 images/day
+  pro: 10,         // $150/mo — 10 images/day
+  ultra_pro: 15,   // $250/mo — 15 images/day
 };
 
 export function getPromptLimit(plan: SubscriptionPlan): number | null {
   return PROMPT_LIMITS[plan];
 }
 
-export function getAttachmentLimit(plan: SubscriptionPlan): number {
-  return ATTACHMENT_LIMITS[plan] ?? 0;
-}
-
 export function canGenerateImages(imagePlan: ImagePlan): boolean {
   return imagePlan !== "none";
 }
 
-export function getImageLimit(imagePlan: ImagePlan): number | null {
+export function getImageLimit(imagePlan: ImagePlan): number {
   return IMAGE_LIMITS[imagePlan];
+}
+
+export function getAttachmentLimit(plan: SubscriptionPlan): number {
+  if (plan === "ultra_pro") return 100;
+  if (plan === "pro") return 50;
+  if (plan === "standard") return 20;
+  return 0;
 }

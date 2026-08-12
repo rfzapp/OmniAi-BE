@@ -18,6 +18,11 @@ const conversationSchema = new Schema(
       type: String,
       required: true,
     },
+    shareToken: {
+      type: String,
+      default: null,
+      index: { sparse: true },
+    },
   },
   { timestamps: true },
 );

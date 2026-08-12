@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { ApiError } from "../../utils/ApiError";
 import { Conversation } from "./conversation.model";
 import { Message } from "../message/message.model";
@@ -66,6 +67,37 @@ export async function deleteConversation(userId: string, conversationId: string)
   const conversation = await getConversationForUser(userId, conversationId);
   await Message.deleteMany({ conversationId: conversation.id });
   await conversation.deleteOne();
+}
+
+export async function shareConversation(userId: string, conversationId: string) {
+  const conversation = await getConversationForUser(userId, conversationId);
+  if (conversation.shareToken) return conversation; // already shared
+  const token = crypto.randomBytes(24).toString("hex");
+  conversation.shareToken = token;
+  await conversation.save();
+  return conversation;
+}
+
+export async function unshareConversation(userId: string, conversationId: string) {
+  const conversation = await getConversationForUser(userId, conversationId);
+  conversation.shareToken = null;
+  await conversation.save();
+  return conversation;
+}
+
+export async function getSharedConversation(shareToken: string) {
+  const conversation = await Conversation.findOne({ shareToken });
+  if (!conversation) throw ApiError.notFound("Shared conversation not found");
+  return conversation;
+}
+
+export async function getSharedMessages(shareToken: string) {
+  const conversation = await getSharedConversation(shareToken);
+  const messages = await Message.find({ conversationId: conversation.id }).sort({ createdAt: 1 });
+  return {
+    conversation,
+    messages: messages.map((m) => ({ ...m.toJSON(), content: safeDecrypt(m.content) })),
+  };
 }
 
 /**

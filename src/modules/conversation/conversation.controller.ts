@@ -22,3 +22,23 @@ export async function deleteConversationHandler(req: Request, res: Response) {
   await conversationService.deleteConversation(req.user.id, conversationId);
   sendSuccess(res, 200, "Conversation deleted successfully");
 }
+
+export async function shareConversationHandler(req: Request, res: Response) {
+  if (!req.user) throw ApiError.unauthorized();
+  const conversationId = req.params["id"] as string;
+  const conversation = await conversationService.shareConversation(req.user.id, conversationId);
+  sendSuccess(res, 200, "Conversation shared successfully", { shareToken: conversation.shareToken });
+}
+
+export async function unshareConversationHandler(req: Request, res: Response) {
+  if (!req.user) throw ApiError.unauthorized();
+  const conversationId = req.params["id"] as string;
+  await conversationService.unshareConversation(req.user.id, conversationId);
+  sendSuccess(res, 200, "Conversation unshared successfully");
+}
+
+export async function getSharedConversationHandler(req: Request, res: Response) {
+  const shareToken = req.params["token"] as string;
+  const { conversation, messages } = await conversationService.getSharedMessages(shareToken);
+  sendSuccess(res, 200, "Shared conversation fetched successfully", { conversation, messages });
+}

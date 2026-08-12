@@ -46,6 +46,8 @@ export interface IUser {
   promptCount: number;
   promptCount24h: number;
   attachmentCount24h: number;
+  imageCount24h: number;
+  lastImageResetAt: Date;
   lastPromptResetAt: Date;
   emailVerified: boolean;
   preferences: {
@@ -106,7 +108,7 @@ const userSchema = new Schema<IUser, UserModel, IUserMethods>(
     },
     imagePlan: {
       type: String,
-      enum: ["none", "basic", "pro"],
+      enum: ["none", "basic", "pro", "ultra_pro"],
       default: "none",
     },
     promptCount: {
@@ -120,6 +122,14 @@ const userSchema = new Schema<IUser, UserModel, IUserMethods>(
     attachmentCount24h: {
       type: Number,
       default: 0,
+    },
+    imageCount24h: {
+      type: Number,
+      default: 0,
+    },
+    lastImageResetAt: {
+      type: Date,
+      default: Date.now,
     },
     lastPromptResetAt: {
       type: Date,

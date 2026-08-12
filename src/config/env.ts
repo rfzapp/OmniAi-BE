@@ -19,6 +19,9 @@ const envSchema = z.object({
 
   OPENAI_API_KEY: z.string().min(1, "OPENAI_API_KEY is required"),
 
+  // Optional — only required when Claude models are used
+  ANTHROPIC_API_KEY: z.string().optional(),
+
   API_KEY_ENCRYPTION_SECRET: z.string().min(16, "API_KEY_ENCRYPTION_SECRET is required (min 16 chars)"),
 
   FRONTEND_URL: z.string().default("http://localhost:3000"),

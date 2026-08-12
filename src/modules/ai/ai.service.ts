@@ -5,13 +5,21 @@ import { User } from "../user/user.model";
 import * as userService from "../user/user.service";
 import * as conversationService from "../conversation/conversation.service";
 import { openaiProvider } from "./providers/openai.provider";
+import { anthropicProvider } from "./providers/anthropic.provider";
 import { getOpenAIClient } from "../../config/openai";
 import { supportsVision } from "../../config/capabilities";
 import type { ChatInput } from "./ai.validation";
 import type { ProviderChatMessage } from "./providers/provider.types";
 
 const HISTORY_LIMIT = 20;
-const BYOK_PROVIDER = "OpenAI";
+const BYOK_PROVIDER_OPENAI = "OpenAI";
+const BYOK_PROVIDER_ANTHROPIC = "Anthropic";
+
+/** Pick the right provider based on the model ID prefix. */
+function getProvider(model: string) {
+  if (model.startsWith("claude-")) return anthropicProvider;
+  return openaiProvider;
+}
 
 // Keywords that indicate the user wants an image generated.
 const IMAGE_INTENT_PATTERNS = [
@@ -147,10 +155,12 @@ async function generateImage(prompt: string, apiKeyOverride?: string): Promise<s
 }
 
 export async function chat(userId: string, input: ChatInput, files?: Express.Multer.File[]) {
-  const user = await User.findById(userId).select("subscription imagePlan promptCount promptCount24h attachmentCount24h lastPromptResetAt apiKeys.provider");
+  const user = await User.findById(userId).select("subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt apiKeys.provider");
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
-  const usingOwnKey = user.apiKeys.some((entry) => entry.provider === BYOK_PROVIDER);
+  const isClaudeModel = input.model.startsWith("claude-");
+  const byokProvider = isClaudeModel ? BYOK_PROVIDER_ANTHROPIC : BYOK_PROVIDER_OPENAI;
+  const usingOwnKey = user.apiKeys.some((entry) => entry.provider === byokProvider);
   const limit = getPromptLimit(user.subscription);
 
   const now = new Date();
@@ -197,14 +207,27 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     throw new ApiError(403, "Image generation requires an Image Generation plan. Please subscribe to unlock it.");
   }
 
+  if (wantsImage && !usingOwnKey) {
+    const imageLimit = getImageLimit(user.imagePlan);
+    const now2 = new Date();
+    const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now2;
+    const imageCount = (now2.getTime() - lastImageReset.getTime() >= resetInterval)
+      ? 0
+      : (user.imageCount24h ?? 0);
+    if (imageCount >= imageLimit) {
+      throw new ApiError(403, `Daily image limit reached for your plan (${imageLimit} images/day). Upgrade your Image Generation plan for more.`);
+    }
+  }
+
   const imageParts = buildImageContentParts(files);
   const userImageUrl = imageParts[0]?.image_url.url;
 
   const conversation = await conversationService.findOrCreateConversation(userId, input.model, combinedMessage, input.conversationId);
   await conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl);
 
-  const encryptedKey = usingOwnKey ? await userService.getEncryptedApiKey(userId, BYOK_PROVIDER) : null;
+  const encryptedKey = usingOwnKey ? await userService.getEncryptedApiKey(userId, byokProvider) : null;
   const apiKeyOverride = encryptedKey ? decrypt(encryptedKey) : undefined;
+  const provider = getProvider(input.model);
 
   let replyText: string;
   let imageUrl: string | undefined;
@@ -225,7 +248,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
       }
     }
 
-    replyText = await openaiProvider.generateReply(input.model, providerMessages, apiKeyOverride);
+    replyText = await provider.generateReply(input.model, providerMessages, apiKeyOverride);
   }
 
   const assistantMessage = await conversationService.appendMessage(conversation.id as string, "assistant", replyText, input.model, imageUrl);
@@ -249,12 +272,26 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     }
   }
 
+  if (wantsImage && !usingOwnKey) {
+    const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
+    const imageIsReset = now.getTime() - lastImageReset.getTime() >= resetInterval;
+    if (imageIsReset) {
+      updateFields.$set = { ...(updateFields.$set ?? {}), imageCount24h: 1, lastImageResetAt: now };
+    } else {
+      updateFields.$inc.imageCount24h = 1;
+    }
+  }
+
   const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true })
     .select("promptCount promptCount24h attachmentCount24h");
 
   const promptsUsed = usingOwnKey
     ? user.promptCount
     : updatedUser?.promptCount ?? user.promptCount + 1;
+
+  const promptsUsed24h = usingOwnKey
+    ? (user.promptCount24h ?? 0)
+    : updatedUser?.promptCount24h ?? (promptCount24h + 1);
 
   const assistantPayload = {
     id: String(assistantMessage._id),
@@ -273,6 +310,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     imageUrl,
     usage: {
       promptsUsed,
+      promptsUsed24h,
       promptsLimit: usingOwnKey ? null : limit,
     },
   };
