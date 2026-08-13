@@ -1,5 +1,5 @@
 import { ApiError } from "../../utils/ApiError";
-import { getPromptLimit, canGenerateImages, getAttachmentLimit } from "../../config/plans";
+import { getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit } from "../../config/plans";
 import { decrypt } from "../../utils/encryption";
 import { User } from "../user/user.model";
 import * as userService from "../user/user.service";
@@ -165,15 +165,11 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
 
   const now = new Date();
   const resetInterval = 24 * 60 * 60 * 1000;
-  let promptCount24h = user.promptCount24h || 0;
-  let attachmentCount24h = user.attachmentCount24h || 0;
-  let lastPromptResetAt = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : now;
+  const originalLastResetAt = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : null;
+  const needsReset = !originalLastResetAt || (now.getTime() - originalLastResetAt.getTime() >= resetInterval);
 
-  if (now.getTime() - lastPromptResetAt.getTime() >= resetInterval) {
-    promptCount24h = 0;
-    attachmentCount24h = 0;
-    lastPromptResetAt = now;
-  }
+  let promptCount24h = needsReset ? 0 : (user.promptCount24h || 0);
+  let attachmentCount24h = needsReset ? 0 : (user.attachmentCount24h || 0);
 
   if (!usingOwnKey) {
     if (user.subscription === "free") {
@@ -259,8 +255,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   };
 
   if (!usingOwnKey && user.subscription !== "free") {
-    const isReset = now.getTime() - lastPromptResetAt.getTime() >= resetInterval;
-    if (isReset || !user.lastPromptResetAt) {
+    if (needsReset) {
       updateFields.$set = {
         promptCount24h: 1,
         attachmentCount24h: files ? files.length : 0,

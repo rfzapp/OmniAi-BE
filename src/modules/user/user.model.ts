@@ -140,7 +140,7 @@ const userSchema = new Schema<IUser, UserModel, IUserMethods>(
       default: false,
     },
     preferences: {
-      defaultModel: { type: String, default: "gpt-4.1-mini" },
+      defaultModel: { type: String, default: "gpt-5.6-luna" },
       theme: { type: String, enum: ["light", "dark"], default: "light" },
       connectedModelIds: { type: [String], default: DEFAULT_CONNECTED_MODEL_IDS },
       notifications: {
