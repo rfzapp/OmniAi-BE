@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { authMiddleware } from "../../middlewares/auth.middleware";
 import { validate } from "../../middlewares/validate.middleware";
-import { conversationIdParamSchema } from "./conversation.validation";
+import { conversationIdParamSchema, pinConversationBodySchema } from "./conversation.validation";
 import {
   deleteConversationHandler,
   listConversationsHandler,
@@ -9,6 +9,7 @@ import {
   shareConversationHandler,
   unshareConversationHandler,
   getSharedConversationHandler,
+  pinConversationHandler,
 } from "./conversation.controller";
 
 const router = Router();
@@ -23,5 +24,6 @@ router.get("/:id/messages", validate({ params: conversationIdParamSchema }), lis
 router.delete("/:id", validate({ params: conversationIdParamSchema }), deleteConversationHandler);
 router.post("/:id/share", validate({ params: conversationIdParamSchema }), shareConversationHandler);
 router.delete("/:id/share", validate({ params: conversationIdParamSchema }), unshareConversationHandler);
+router.patch("/:id/pin", validate({ params: conversationIdParamSchema, body: pinConversationBodySchema }), pinConversationHandler);
 
 export default router;

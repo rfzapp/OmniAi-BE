@@ -174,7 +174,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   if (!usingOwnKey) {
     if (user.subscription === "free") {
       const freePromptLimit = limit ?? 3;
-      if (user.promptCount >= freePromptLimit) {
+      if (promptCount24h >= freePromptLimit) {
         throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
       }
       if (files && files.length > 0) {
@@ -254,7 +254,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     $inc: { promptCount: 1 }
   };
 
-  if (!usingOwnKey && user.subscription !== "free") {
+  if (!usingOwnKey) {
     if (needsReset) {
       updateFields.$set = {
         promptCount24h: 1,
@@ -263,7 +263,9 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
       };
     } else {
       updateFields.$inc.promptCount24h = 1;
-      updateFields.$inc.attachmentCount24h = files ? files.length : 0;
+      if (user.subscription !== "free") {
+        updateFields.$inc.attachmentCount24h = files ? files.length : 0;
+      }
     }
   }
 

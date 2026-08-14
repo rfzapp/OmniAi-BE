@@ -37,6 +37,14 @@ export async function unshareConversationHandler(req: Request, res: Response) {
   sendSuccess(res, 200, "Conversation unshared successfully");
 }
 
+export async function pinConversationHandler(req: Request, res: Response) {
+  if (!req.user) throw ApiError.unauthorized();
+  const conversationId = req.params["id"] as string;
+  const { isPinned } = req.body;
+  const conversation = await conversationService.pinConversation(req.user.id, conversationId, isPinned);
+  sendSuccess(res, 200, isPinned ? "Conversation pinned successfully" : "Conversation unpinned successfully", { conversation });
+}
+
 export async function getSharedConversationHandler(req: Request, res: Response) {
   const shareToken = req.params["token"] as string;
   const { conversation, messages } = await conversationService.getSharedMessages(shareToken);

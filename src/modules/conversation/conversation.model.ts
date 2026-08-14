@@ -23,6 +23,10 @@ const conversationSchema = new Schema(
       default: null,
       index: { sparse: true },
     },
+    isPinned: {
+      type: Boolean,
+      default: false,
+    },
   },
   { timestamps: true },
 );

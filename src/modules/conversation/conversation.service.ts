@@ -14,7 +14,7 @@ function buildTitle(firstMessage: string): string {
 }
 
 export async function listConversations(userId: string) {
-  return Conversation.find({ userId }).sort({ updatedAt: -1 });
+  return Conversation.find({ userId }).sort({ isPinned: -1, updatedAt: -1 });
 }
 
 export async function getConversationForUser(userId: string, conversationId: string) {
@@ -67,6 +67,13 @@ export async function deleteConversation(userId: string, conversationId: string)
   const conversation = await getConversationForUser(userId, conversationId);
   await Message.deleteMany({ conversationId: conversation.id });
   await conversation.deleteOne();
+}
+
+export async function pinConversation(userId: string, conversationId: string, isPinned: boolean) {
+  const conversation = await getConversationForUser(userId, conversationId);
+  conversation.isPinned = isPinned;
+  await conversation.save();
+  return conversation;
 }
 
 export async function shareConversation(userId: string, conversationId: string) {
