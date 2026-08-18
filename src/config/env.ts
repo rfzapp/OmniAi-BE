@@ -22,6 +22,12 @@ const envSchema = z.object({
   // Optional — only required when Claude models are used
   ANTHROPIC_API_KEY: z.string().optional(),
 
+  // Optional — only required when Grok models are used (xAI API key)
+  XAI_API_KEY: z.string().optional(),
+
+  // Optional — only required when DeepSeek models are used
+  DEEPSEEK_API_KEY: z.string().optional(),
+
   API_KEY_ENCRYPTION_SECRET: z.string().min(16, "API_KEY_ENCRYPTION_SECRET is required (min 16 chars)"),
 
   FRONTEND_URL: z.string().default("http://localhost:3000"),

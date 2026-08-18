@@ -6,6 +6,8 @@ import * as userService from "../user/user.service";
 import * as conversationService from "../conversation/conversation.service";
 import { openaiProvider } from "./providers/openai.provider";
 import { anthropicProvider } from "./providers/anthropic.provider";
+import { groqProvider } from "./providers/groq.provider";
+import { deepseekProvider } from "./providers/deepseek.provider";
 import { getOpenAIClient } from "../../config/openai";
 import { supportsVision } from "../../config/capabilities";
 import type { ChatInput } from "./ai.validation";
@@ -14,11 +16,23 @@ import type { ProviderChatMessage } from "./providers/provider.types";
 const HISTORY_LIMIT = 20;
 const BYOK_PROVIDER_OPENAI = "OpenAI";
 const BYOK_PROVIDER_ANTHROPIC = "Anthropic";
+const BYOK_PROVIDER_GROQ = "Groq";
+const BYOK_PROVIDER_DEEPSEEK = "DeepSeek";
 
 /** Pick the right provider based on the model ID prefix. */
 function getProvider(model: string) {
   if (model.startsWith("claude-")) return anthropicProvider;
+  if (model.startsWith("grok-")) return groqProvider;
+  if (model.startsWith("deepseek-")) return deepseekProvider;
   return openaiProvider;
+}
+
+/** Pick the right BYOK provider name based on model. */
+function getByokProvider(model: string): string {
+  if (model.startsWith("claude-")) return BYOK_PROVIDER_ANTHROPIC;
+  if (model.startsWith("grok-")) return BYOK_PROVIDER_GROQ;
+  if (model.startsWith("deepseek-")) return BYOK_PROVIDER_DEEPSEEK;
+  return BYOK_PROVIDER_OPENAI;
 }
 
 // Keywords that indicate the user wants an image generated.
@@ -159,7 +173,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
   const isClaudeModel = input.model.startsWith("claude-");
-  const byokProvider = isClaudeModel ? BYOK_PROVIDER_ANTHROPIC : BYOK_PROVIDER_OPENAI;
+  const byokProvider = getByokProvider(input.model);
   const usingOwnKey = user.apiKeys.some((entry) => entry.provider === byokProvider);
   const limit = getPromptLimit(user.subscription);
 
@@ -174,7 +188,8 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   if (!usingOwnKey) {
     if (user.subscription === "free") {
       const freePromptLimit = limit ?? 3;
-      if (promptCount24h >= freePromptLimit) {
+      // Free plan uses total promptCount (lifetime limit, not daily)
+      if (user.promptCount >= freePromptLimit) {
         throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
       }
       if (files && files.length > 0) {
@@ -183,7 +198,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     } else {
       const promptLimit = limit;
       if (promptLimit !== null && (promptCount24h + 1) > promptLimit) {
-        throw new ApiError(403, `Daily prompt limit reached for your ${user.subscription} plan (${promptLimit} prompts).`);
+        throw new ApiError(403, `Daily prompt limit reached for your ${user.subscription} plan (${promptLimit} prompts/day). Limit resets every 24 hours.`);
       }
 
       const attachmentLimit = getAttachmentLimit(user.subscription);
@@ -256,14 +271,15 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
 
   if (!usingOwnKey) {
     if (needsReset) {
+      // Always persist the reset timestamp so the 24hr window starts fresh
       updateFields.$set = {
-        promptCount24h: 1,
-        attachmentCount24h: files ? files.length : 0,
+        promptCount24h: user.subscription === "free" ? (user.promptCount24h ?? 0) : 1,
+        attachmentCount24h: user.subscription === "free" ? 0 : (files ? files.length : 0),
         lastPromptResetAt: now,
       };
     } else {
-      updateFields.$inc.promptCount24h = 1;
       if (user.subscription !== "free") {
+        updateFields.$inc.promptCount24h = 1;
         updateFields.$inc.attachmentCount24h = files ? files.length : 0;
       }
     }
