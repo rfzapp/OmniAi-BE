@@ -1,6 +1,6 @@
 import type { ImagePlan, SubscriptionPlan } from "../types";
 
-/** `null` means unlimited prompts for that plan. */
+/** `null` means unlimited prompts for that plan. Monthly limits for paid plans. */
 export const PROMPT_LIMITS: Record<SubscriptionPlan, number | null> = {
   free: 3,
   standard: 100,
@@ -8,7 +8,7 @@ export const PROMPT_LIMITS: Record<SubscriptionPlan, number | null> = {
   ultra_pro: 1500,
 };
 
-/** Daily image generation limits per image plan. */
+/** Monthly image generation limits per image plan. */
 export const IMAGE_LIMITS: Record<ImagePlan, number> = {
   none: 0,
   basic: 3,        // $50/mo — 3 images/day

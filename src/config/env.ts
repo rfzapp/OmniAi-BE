@@ -28,6 +28,15 @@ const envSchema = z.object({
   // Optional — only required when DeepSeek models are used
   DEEPSEEK_API_KEY: z.string().optional(),
 
+  // Optional — only required when Qwen models are used
+  QWEN_API_KEY: z.string().optional(),
+
+  // Optional — only required when Mistral models are used
+  MISTRAL_API_KEY: z.string().optional(),
+
+  // Optional — only required when Kimi models are used
+  KIMI_API_KEY: z.string().optional(),
+
   API_KEY_ENCRYPTION_SECRET: z.string().min(16, "API_KEY_ENCRYPTION_SECRET is required (min 16 chars)"),
 
   FRONTEND_URL: z.string().default("http://localhost:3000"),

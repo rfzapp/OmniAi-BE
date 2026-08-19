@@ -31,6 +31,9 @@ const conversationSchema = new Schema(
   { timestamps: true },
 );
 
+// Compound index covers the list query: find({ userId }).sort({ isPinned: -1, updatedAt: -1 })
+conversationSchema.index({ userId: 1, isPinned: -1, updatedAt: -1 });
+
 // Mongoose's `id` virtual (string form of `_id`) isn't included in JSON
 // output by default — without this, every conversation would serialize
 // with `_id` only, leaving the frontend's `id` field undefined.

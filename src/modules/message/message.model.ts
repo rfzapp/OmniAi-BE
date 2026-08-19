@@ -27,6 +27,11 @@ const messageSchema = new Schema(
   { timestamps: { createdAt: true, updatedAt: false } },
 );
 
+// Compound index covers both query patterns:
+// 1. Message.find({ conversationId }).sort({ createdAt: 1 })  — full history
+// 2. Message.find({ conversationId }).sort({ createdAt: -1 }).limit(N) — recent context
+messageSchema.index({ conversationId: 1, createdAt: 1 });
+
 messageSchema.set("toJSON", {
   virtuals: true,
   transform: (_doc, ret) => {

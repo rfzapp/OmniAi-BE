@@ -24,8 +24,11 @@ export async function getConversationForUser(userId: string, conversationId: str
 }
 
 export async function listMessages(userId: string, conversationId: string) {
-  await getConversationForUser(userId, conversationId);
-  const messages = await Message.find({ conversationId }).sort({ createdAt: 1 });
+  // Run ownership check and message fetch in parallel — both are reads
+  const [, messages] = await Promise.all([
+    getConversationForUser(userId, conversationId),
+    Message.find({ conversationId }, { role: 1, content: 1, model: 1, imageUrl: 1, createdAt: 1 }).sort({ createdAt: 1 }),
+  ]);
   return messages.map((m) => ({
     ...m.toJSON(),
     content: safeDecrypt(m.content),
@@ -50,7 +53,10 @@ export async function appendMessage(conversationId: string, role: MessageRole, c
 }
 
 export async function getRecentMessages(conversationId: string, limit: number) {
-  const messages = await Message.find({ conversationId }).sort({ createdAt: -1 }).limit(limit);
+  const messages = await Message.find(
+    { conversationId },
+    { role: 1, content: 1, model: 1, imageUrl: 1, createdAt: 1 },
+  ).sort({ createdAt: -1 }).limit(limit);
   return messages.reverse().map((m) => ({
     ...m.toObject(),
     id: (m as any).id as string,
@@ -59,8 +65,10 @@ export async function getRecentMessages(conversationId: string, limit: number) {
   }));
 }
 
-export async function touchConversation(conversationId: string) {
-  await Conversation.findByIdAndUpdate(conversationId, { updatedAt: new Date() });
+export function touchConversation(conversationId: string): void {
+  // Fire-and-forget — nothing in the response path depends on this timestamp.
+  // eslint-disable-next-line @typescript-eslint/no-floating-promises
+  Conversation.findByIdAndUpdate(conversationId, { updatedAt: new Date() });
 }
 
 export async function deleteConversation(userId: string, conversationId: string) {

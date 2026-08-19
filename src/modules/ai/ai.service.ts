@@ -8,6 +8,9 @@ import { openaiProvider } from "./providers/openai.provider";
 import { anthropicProvider } from "./providers/anthropic.provider";
 import { groqProvider } from "./providers/groq.provider";
 import { deepseekProvider } from "./providers/deepseek.provider";
+import { qwenProvider } from "./providers/qwen.provider";
+import { mistralProvider } from "./providers/mistral.provider";
+import { kimiProvider } from "./providers/kimi.provider";
 import { getOpenAIClient } from "../../config/openai";
 import { supportsVision } from "../../config/capabilities";
 import type { ChatInput } from "./ai.validation";
@@ -18,12 +21,18 @@ const BYOK_PROVIDER_OPENAI = "OpenAI";
 const BYOK_PROVIDER_ANTHROPIC = "Anthropic";
 const BYOK_PROVIDER_GROQ = "Groq";
 const BYOK_PROVIDER_DEEPSEEK = "DeepSeek";
+const BYOK_PROVIDER_QWEN = "Qwen";
+const BYOK_PROVIDER_MISTRAL = "Mistral";
+const BYOK_PROVIDER_KIMI = "Kimi";
 
 /** Pick the right provider based on the model ID prefix. */
 function getProvider(model: string) {
   if (model.startsWith("claude-")) return anthropicProvider;
   if (model.startsWith("grok-")) return groqProvider;
   if (model.startsWith("deepseek-")) return deepseekProvider;
+  if (model.startsWith("qwen-")) return qwenProvider;
+  if (model.startsWith("mistral-") || model.startsWith("codestral-")) return mistralProvider;
+  if (model.startsWith("moonshot-") || model.startsWith("kimi-")) return kimiProvider;
   return openaiProvider;
 }
 
@@ -32,6 +41,9 @@ function getByokProvider(model: string): string {
   if (model.startsWith("claude-")) return BYOK_PROVIDER_ANTHROPIC;
   if (model.startsWith("grok-")) return BYOK_PROVIDER_GROQ;
   if (model.startsWith("deepseek-")) return BYOK_PROVIDER_DEEPSEEK;
+  if (model.startsWith("qwen-")) return BYOK_PROVIDER_QWEN;
+  if (model.startsWith("mistral-") || model.startsWith("codestral-")) return BYOK_PROVIDER_MISTRAL;
+  if (model.startsWith("moonshot-") || model.startsWith("kimi-")) return BYOK_PROVIDER_KIMI;
   return BYOK_PROVIDER_OPENAI;
 }
 
@@ -79,52 +91,49 @@ function extractXlsxText(buffer: Buffer): string {
 async function extractAttachmentContext(files: Express.Multer.File[] | undefined, model: string): Promise<string> {
   if (!files || files.length === 0) return "";
 
-  const sections: string[] = [];
+  const sections = await Promise.all(
+    files.map(async (file) => {
+      const name = file.originalname || file.filename || file.fieldname || "attached file";
+      const lower = name.toLowerCase();
+      const mime = file.mimetype || "application/octet-stream";
 
-  for (const file of files) {
-    const name = file.originalname || file.filename || file.fieldname || "attached file";
-    const lower = name.toLowerCase();
-    const mime = file.mimetype || "application/octet-stream";
-
-    if (mime.startsWith("image/")) {
-      if (!supportsVision(model)) {
-        throw ApiError.badRequest("This model does not support image attachments. Please select a vision-capable model.");
+      if (mime.startsWith("image/")) {
+        if (!supportsVision(model)) {
+          throw ApiError.badRequest("This model does not support image attachments. Please select a vision-capable model.");
+        }
+        return null; // vision models handle images via buildImageContentParts
       }
-      // For vision-capable models, we skip textual fallbacks so the model
-      // receives the absolute image payload via buildImageContentParts.
-      continue;
-    }
 
-    let text = "";
+      let text = "";
 
-    if (mime === "application/pdf" || lower.endsWith(".pdf")) {
-      text = await extractPdfText(file.buffer);
-    } else if (
-      mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-      mime === "application/msword" ||
-      lower.endsWith(".docx") ||
-      lower.endsWith(".doc")
-    ) {
-      text = await extractDocxText(file.buffer);
-    } else if (
-      mime === "application/vnd.ms-excel" ||
-      mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
-      lower.endsWith(".xls") ||
-      lower.endsWith(".xlsx")
-    ) {
-      text = extractXlsxText(file.buffer);
-    } else {
-      throw ApiError.badRequest(`Unsupported attachment type: ${name}`);
-    }
+      if (mime === "application/pdf" || lower.endsWith(".pdf")) {
+        text = await extractPdfText(file.buffer);
+      } else if (
+        mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+        mime === "application/msword" ||
+        lower.endsWith(".docx") ||
+        lower.endsWith(".doc")
+      ) {
+        text = await extractDocxText(file.buffer);
+      } else if (
+        mime === "application/vnd.ms-excel" ||
+        mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+        lower.endsWith(".xls") ||
+        lower.endsWith(".xlsx")
+      ) {
+        text = extractXlsxText(file.buffer);
+      } else {
+        throw ApiError.badRequest(`Unsupported attachment type: ${name}`);
+      }
 
-    if (!text.trim()) {
-      sections.push(`Attachment file ${name} (${mime}, ${file.size} bytes) was received but did not yield readable text.`);
-    } else {
-      sections.push(`Attachment file ${name} (${mime}, ${file.size} bytes) content:\n${text}`);
-    }
-  }
+      if (!text.trim()) {
+        return `Attachment file ${name} (${mime}, ${file.size} bytes) was received but did not yield readable text.`;
+      }
+      return `Attachment file ${name} (${mime}, ${file.size} bytes) content:\n${text}`;
+    }),
+  );
 
-  return sections.join("\n\n");
+  return sections.filter(Boolean).join("\n\n");
 }
 
 function buildImageContentParts(files: Express.Multer.File[] | undefined) {
@@ -172,13 +181,12 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const user = await User.findById(userId).select("subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt apiKeys.provider");
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
-  const isClaudeModel = input.model.startsWith("claude-");
   const byokProvider = getByokProvider(input.model);
   const usingOwnKey = user.apiKeys.some((entry) => entry.provider === byokProvider);
   const limit = getPromptLimit(user.subscription);
 
   const now = new Date();
-  const resetInterval = 24 * 60 * 60 * 1000;
+  const resetInterval = 30 * 24 * 60 * 60 * 1000; // 30-day monthly window
   const originalLastResetAt = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : null;
   const needsReset = !originalLastResetAt || (now.getTime() - originalLastResetAt.getTime() >= resetInterval);
 
@@ -188,7 +196,6 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   if (!usingOwnKey) {
     if (user.subscription === "free") {
       const freePromptLimit = limit ?? 3;
-      // Free plan uses total promptCount (lifetime limit, not daily)
       if (user.promptCount >= freePromptLimit) {
         throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
       }
@@ -198,18 +205,24 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     } else {
       const promptLimit = limit;
       if (promptLimit !== null && (promptCount24h + 1) > promptLimit) {
-        throw new ApiError(403, `Daily prompt limit reached for your ${user.subscription} plan (${promptLimit} prompts/day). Limit resets every 24 hours.`);
+        throw new ApiError(403, `Monthly prompt limit reached for your ${user.subscription} plan (${promptLimit} prompts/month). Limit resets every 30 days.`);
       }
 
       const attachmentLimit = getAttachmentLimit(user.subscription);
       const attachmentsCount = files ? files.length : 0;
       if ((attachmentCount24h + attachmentsCount) > attachmentLimit) {
-        throw new ApiError(403, `Daily file attachment limit reached for your ${user.subscription} plan (${attachmentLimit} attachments).`);
+        throw new ApiError(403, `Monthly file attachment limit reached for your ${user.subscription} plan (${attachmentLimit} attachments).`);
       }
     }
   }
 
-  const attachmentContext = await extractAttachmentContext(files, input.model);
+  // Parse attachments + find/create conversation + fetch BYOK key — all in parallel
+  const [attachmentContext, conversation, encryptedKey] = await Promise.all([
+    extractAttachmentContext(files, input.model),
+    conversationService.findOrCreateConversation(userId, input.model, input.message, input.conversationId),
+    usingOwnKey ? userService.getEncryptedApiKey(userId, byokProvider) : Promise.resolve(null),
+  ]);
+
   const combinedMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
 
   const wantsImage = isImageRequest(input.message);
@@ -220,9 +233,8 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
 
   if (wantsImage && !usingOwnKey) {
     const imageLimit = getImageLimit(user.imagePlan);
-    const now2 = new Date();
-    const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now2;
-    const imageCount = (now2.getTime() - lastImageReset.getTime() >= resetInterval)
+    const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
+    const imageCount = (now.getTime() - lastImageReset.getTime() >= resetInterval)
       ? 0
       : (user.imageCount24h ?? 0);
     if (imageCount >= imageLimit) {
@@ -233,12 +245,14 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const imageParts = buildImageContentParts(files);
   const userImageUrl = imageParts[0]?.image_url.url;
 
-  const conversation = await conversationService.findOrCreateConversation(userId, input.model, combinedMessage, input.conversationId);
-  await conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl);
-
-  const encryptedKey = usingOwnKey ? await userService.getEncryptedApiKey(userId, byokProvider) : null;
   const apiKeyOverride = encryptedKey ? decrypt(encryptedKey) : undefined;
   const provider = getProvider(input.model);
+
+  // Append user message + fetch history for AI context in parallel
+  const [, history] = await Promise.all([
+    conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
+    wantsImage ? Promise.resolve([]) : conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT),
+  ]);
 
   let replyText: string;
   let imageUrl: string | undefined;
@@ -247,7 +261,6 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     imageUrl = await generateImage(input.message, apiKeyOverride);
     replyText = "Here is your generated image.";
   } else {
-    const history = await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
     const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
     if (imageParts.length > 0) {
       const lastUser = [...providerMessages].reverse().find((m) => m.role === "user");
@@ -258,30 +271,24 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
           : [...imageParts];
       }
     }
-
     replyText = await provider.generateReply(input.model, providerMessages, apiKeyOverride);
   }
 
-  const assistantMessage = await conversationService.appendMessage(conversation.id as string, "assistant", replyText, input.model, imageUrl);
-  await conversationService.touchConversation(conversation.id as string);
-
-  const updateFields: any = {
-    $inc: { promptCount: 1 }
+  // Append assistant reply + update user counters in parallel; touch conversation fire-and-forget
+  const updateFields: Record<string, any> = {
+    $inc: { promptCount: 1 },
   };
 
   if (!usingOwnKey) {
     if (needsReset) {
-      // Always persist the reset timestamp so the 24hr window starts fresh
       updateFields.$set = {
         promptCount24h: user.subscription === "free" ? (user.promptCount24h ?? 0) : 1,
         attachmentCount24h: user.subscription === "free" ? 0 : (files ? files.length : 0),
         lastPromptResetAt: now,
       };
-    } else {
-      if (user.subscription !== "free") {
-        updateFields.$inc.promptCount24h = 1;
-        updateFields.$inc.attachmentCount24h = files ? files.length : 0;
-      }
+    } else if (user.subscription !== "free") {
+      updateFields.$inc.promptCount24h = 1;
+      updateFields.$inc.attachmentCount24h = files ? files.length : 0;
     }
   }
 
@@ -295,8 +302,13 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     }
   }
 
-  const updatedUser = await User.findByIdAndUpdate(userId, updateFields, { new: true })
-    .select("promptCount promptCount24h attachmentCount24h");
+  const [assistantMessage, updatedUser] = await Promise.all([
+    conversationService.appendMessage(conversation.id as string, "assistant", replyText, input.model, imageUrl),
+    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
+  ]);
+
+  // Touch conversation timestamp — not in critical path, fire-and-forget
+  conversationService.touchConversation(conversation.id as string);
 
   const promptsUsed = usingOwnKey
     ? user.promptCount
@@ -317,8 +329,6 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
 
   return {
     conversation,
-    // Return plaintext content — the stored version is encrypted at rest.
-    // The controller sends this directly to the frontend.
     message: assistantPayload,
     imageUrl,
     usage: {

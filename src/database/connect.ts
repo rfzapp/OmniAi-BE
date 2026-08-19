@@ -16,7 +16,12 @@ export async function connectDB(): Promise<void> {
     console.warn("[database] MongoDB disconnected");
   });
 
-  await mongoose.connect(env.MONGO_URI);
+  await mongoose.connect(env.MONGO_URI, {
+    maxPoolSize: 20,
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+    connectTimeoutMS: 10000,
+  });
 }
 
 export async function disconnectDB(): Promise<void> {
