@@ -3,7 +3,7 @@ import multer from "multer";
 import { authMiddleware } from "../../middlewares/auth.middleware";
 import { validate } from "../../middlewares/validate.middleware";
 import { chatSchema } from "./ai.validation";
-import { chatHandler } from "./ai.controller";
+import { chatHandler, chatStreamHandler } from "./ai.controller";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -49,5 +49,6 @@ const router = Router();
 
 router.use(authMiddleware);
 router.post("/chat", upload.array("attachments", 5), validate({ body: chatSchema }), chatHandler);
+router.post("/chat/stream", upload.array("attachments", 5), validate({ body: chatSchema }), chatStreamHandler);
 
 export default router;

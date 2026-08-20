@@ -63,4 +63,17 @@ export const openaiProvider: AIProvider = {
       throw ApiError.internal("Failed to reach AI provider");
     }
   },
+
+  async *generateStream(model, messages, apiKeyOverride) {
+    const client = getOpenAIClient(apiKeyOverride);
+    const stream = await client.chat.completions.create({
+      model,
+      messages: toOpenAIMessages(messages),
+      stream: true,
+    });
+    for await (const chunk of stream) {
+      const token = chunk.choices[0]?.delta?.content;
+      if (token) yield token;
+    }
+  },
 };

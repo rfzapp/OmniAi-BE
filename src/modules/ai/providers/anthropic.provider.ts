@@ -24,13 +24,9 @@ export const anthropicProvider: AIProvider = {
   async generateReply(model, messages, apiKeyOverride) {
     try {
       const client = getAnthropicClient(apiKeyOverride);
-
-      // Extract system message if present
       const systemMsg = messages.find((m) => m.role === "system");
       const system = systemMsg
-        ? typeof systemMsg.content === "string"
-          ? systemMsg.content
-          : undefined
+        ? typeof systemMsg.content === "string" ? systemMsg.content : undefined
         : undefined;
 
       const response = await client.messages.create({
@@ -44,11 +40,9 @@ export const anthropicProvider: AIProvider = {
       if (!block || block.type !== "text") {
         throw ApiError.internal("Claude returned an empty response");
       }
-
       return block.text;
     } catch (err) {
       if (err instanceof ApiError) throw err;
-
       if (err instanceof Anthropic.APIError) {
         const status = err.status;
         if (status === 401) throw ApiError.internal("Claude rejected the configured API key");
@@ -57,8 +51,30 @@ export const anthropicProvider: AIProvider = {
         if (status === 529) throw new ApiError(503, "Claude is currently overloaded, please try again later");
         throw new ApiError(status ?? 502, err.message || "Claude request failed");
       }
-
       throw ApiError.internal("Failed to reach Claude");
+    }
+  },
+
+  async *generateStream(model, messages, apiKeyOverride) {
+    const client = getAnthropicClient(apiKeyOverride);
+    const systemMsg = messages.find((m) => m.role === "system");
+    const system = systemMsg
+      ? typeof systemMsg.content === "string" ? systemMsg.content : undefined
+      : undefined;
+
+    const stream = await client.messages.stream({
+      model,
+      max_tokens: MAX_TOKENS,
+      ...(system ? { system } : {}),
+      messages: toAnthropicMessages(messages),
+    });
+    for await (const event of stream) {
+      if (
+        event.type === "content_block_delta" &&
+        event.delta.type === "text_delta"
+      ) {
+        yield event.delta.text;
+      }
     }
   },
 };

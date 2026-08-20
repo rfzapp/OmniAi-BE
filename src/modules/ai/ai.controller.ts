@@ -28,3 +28,46 @@ export async function chatHandler(req: Request, res: Response) {
     usage,
   });
 }
+
+export async function chatStreamHandler(req: Request, res: Response) {
+  if (!req.user) {
+    res.status(401).json({ success: false, message: "Unauthorized" });
+    return;
+  }
+
+  // SSE headers — must be set before any write
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
+  res.flushHeaders();
+
+  const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
+
+  function sendEvent(data: object) {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
+  try {
+    const generator = aiService.chatStream(req.user.id, req.body, files);
+
+    for await (const chunk of generator) {
+      if (typeof chunk === "string") {
+        // Token chunk
+        sendEvent({ token: chunk });
+      } else {
+        // Final done event with conversation/message/usage metadata
+        sendEvent(chunk);
+      }
+    }
+  } catch (err) {
+    const apiErr = err instanceof ApiError ? err : null;
+    sendEvent({
+      error: true,
+      status: apiErr?.statusCode ?? 500,
+      message: apiErr?.message ?? "Something went wrong",
+    });
+  } finally {
+    res.end();
+  }
+}

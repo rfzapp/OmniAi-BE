@@ -21,6 +21,8 @@ export interface ProviderChatMessage {
 }
 
 export interface AIProvider {
-  /** apiKeyOverride: when set (BYOK), use the caller's own key instead of the platform's shared one. */
+  /** Returns the full response text (non-streaming fallback). */
   generateReply(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string): Promise<string>;
+  /** Streams tokens via async generator. Each yielded string is a token chunk. */
+  generateStream(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string): AsyncGenerator<string>;
 }

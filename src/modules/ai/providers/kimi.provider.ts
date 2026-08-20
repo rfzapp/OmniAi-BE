@@ -35,4 +35,21 @@ export const kimiProvider: AIProvider = {
       throw ApiError.internal("Failed to reach Kimi");
     }
   },
+
+  async *generateStream(model, messages, apiKeyOverride) {
+    const client = getKimiClient(apiKeyOverride);
+    const stream = await client.chat.completions.create({
+      model,
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: typeof m.content === "string" ? m.content
+          : m.content.filter((p) => p.type === "text").map((p) => (p as any).text).join("\n"),
+      })) as ChatCompletionMessageParam[],
+      stream: true,
+    });
+    for await (const chunk of stream) {
+      const token = chunk.choices[0]?.delta?.content;
+      if (token) yield token;
+    }
+  },
 };
