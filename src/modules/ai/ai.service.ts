@@ -248,11 +248,11 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const apiKeyOverride = encryptedKey ? decrypt(encryptedKey) : undefined;
   const provider = getProvider(input.model);
 
-  // Append user message + fetch history for AI context in parallel
-  const [, history] = await Promise.all([
-    conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
-    wantsImage ? Promise.resolve([]) : conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT),
-  ]);
+  // Append user message first, then fetch history for AI context
+  await conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl);
+  const history = wantsImage
+    ? []
+    : await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
 
   let replyText: string;
   let imageUrl: string | undefined;
