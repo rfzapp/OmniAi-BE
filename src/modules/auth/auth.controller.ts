@@ -49,3 +49,15 @@ export async function refreshHandler(req: Request, res: Response) {
   res.cookie(REFRESH_COOKIE_NAME, refreshToken, refreshCookieOptions());
   sendSuccess(res, 200, "Token refreshed successfully", { accessToken, refreshToken });
 }
+
+export async function forgotPasswordHandler(req: Request, res: Response) {
+  await authService.forgotPassword(req.body.email as string);
+  // Always return 200 — don't reveal whether the email exists
+  sendSuccess(res, 200, "If that email is registered, a reset link has been sent.");
+}
+
+export async function resetPasswordHandler(req: Request, res: Response) {
+  const { token, password } = req.body as { token: string; password: string };
+  await authService.resetPassword(token, password);
+  sendSuccess(res, 200, "Password reset successfully. You can now log in with your new password.");
+}

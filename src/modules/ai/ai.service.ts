@@ -397,13 +397,22 @@ export async function* chatStream(
   const apiKeyOverride = encryptedKey ? decrypt(encryptedKey) : undefined;
   const provider = getProvider(input.model);
 
-  await conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl);
-  const history = await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
+  // Append user message and fetch history in parallel — history fetch doesn't
+  // need the user message to exist yet since it was just created this turn.
+  const [, history] = await Promise.all([
+    conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
+    conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT),
+  ]);
 
   const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
+
+  // Add the current user message (appended in parallel so may not be in history yet)
+  providerMessages.push({ role: "user", content: combinedMessage });
+
   if (imageParts.length > 0) {
-    const lastUser = [...providerMessages].reverse().find((m) => m.role === "user");
-    if (lastUser) {
+    // The last message is always the current user message we just pushed
+    const lastUser = providerMessages[providerMessages.length - 1];
+    if (lastUser && lastUser.role === "user") {
       const textContent = String(lastUser.content || "").trim();
       lastUser.content = textContent
         ? [{ type: "text", text: textContent }, ...imageParts]

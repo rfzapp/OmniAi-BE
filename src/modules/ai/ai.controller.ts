@@ -40,12 +40,19 @@ export async function chatStreamHandler(req: Request, res: Response) {
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
+  res.setHeader("Transfer-Encoding", "chunked");
   res.flushHeaders();
 
   const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
 
   function sendEvent(data: object) {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
+    // Force-flush the response buffer so each token reaches the client immediately.
+    // This matters when compression middleware or Node's internal buffering
+    // would otherwise batch multiple small writes together.
+    if (typeof (res as any).flush === "function") {
+      (res as any).flush();
+    }
   }
 
   try {

@@ -50,6 +50,8 @@ export interface IUser {
   lastImageResetAt: Date;
   lastPromptResetAt: Date;
   emailVerified: boolean;
+  passwordResetToken: string | null;
+  passwordResetExpiresAt: Date | null;
   preferences: {
     defaultModel: string;
     theme: "light" | "dark";
@@ -138,6 +140,16 @@ const userSchema = new Schema<IUser, UserModel, IUserMethods>(
     emailVerified: {
       type: Boolean,
       default: false,
+    },
+    passwordResetToken: {
+      type: String,
+      default: null,
+      select: false,
+    },
+    passwordResetExpiresAt: {
+      type: Date,
+      default: null,
+      select: false,
     },
     preferences: {
       defaultModel: { type: String, default: "gpt-5.6-luna" },

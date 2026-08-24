@@ -67,8 +67,14 @@ export async function getRecentMessages(conversationId: string, limit: number) {
 
 export function touchConversation(conversationId: string): void {
   // Fire-and-forget — nothing in the response path depends on this timestamp.
+  // Use $set with { timestamps: false } to force-update updatedAt even though
+  // Mongoose's timestamps option is active (it would otherwise ignore manual updates).
   // eslint-disable-next-line @typescript-eslint/no-floating-promises
-  Conversation.findByIdAndUpdate(conversationId, { updatedAt: new Date() });
+  Conversation.findByIdAndUpdate(
+    conversationId,
+    { $set: { updatedAt: new Date() } },
+    { timestamps: false },
+  );
 }
 
 export async function deleteConversation(userId: string, conversationId: string) {

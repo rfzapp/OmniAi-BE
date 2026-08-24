@@ -9,7 +9,7 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: 3 * 1024 * 1024,
-    files: 5,
+    files: 1,
   },
   fileFilter: (_req, file, cb) => {
     const allowed = [
@@ -48,7 +48,7 @@ const upload = multer({
 const router = Router();
 
 router.use(authMiddleware);
-router.post("/chat", upload.array("attachments", 5), validate({ body: chatSchema }), chatHandler);
-router.post("/chat/stream", upload.array("attachments", 5), validate({ body: chatSchema }), chatStreamHandler);
+router.post("/chat", upload.array("attachments", 1), validate({ body: chatSchema }), chatHandler);
+router.post("/chat/stream", upload.array("attachments", 1), validate({ body: chatSchema }), chatStreamHandler);
 
 export default router;

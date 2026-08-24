@@ -32,7 +32,14 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 app.use(cookieParser());
-app.use(compression());
+app.use(compression({
+  // Skip compression for SSE streaming routes — compression buffers the
+  // entire response before sending, which kills token-by-token delivery.
+  filter: (req, res) => {
+    if (req.path.includes("/chat/stream")) return false;
+    return compression.filter(req, res);
+  },
+}));
 app.use(morgan(isProduction ? "combined" : "dev"));
 
 app.get("/api/health", (_req, res) => {

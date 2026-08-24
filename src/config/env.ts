@@ -40,6 +40,13 @@ const envSchema = z.object({
   API_KEY_ENCRYPTION_SECRET: z.string().min(16, "API_KEY_ENCRYPTION_SECRET is required (min 16 chars)"),
 
   FRONTEND_URL: z.string().default("http://localhost:3000"),
+
+  // Email (nodemailer) — required for forgot-password flow
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().default(587),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
+  SMTP_FROM: z.string().default("OmniAI <noreply@omniai.app>"),
 });
 
 const parsed = envSchema.safeParse(process.env);
