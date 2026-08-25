@@ -177,6 +177,139 @@ async function generateImage(prompt: string, apiKeyOverride?: string): Promise<s
   throw ApiError.internal("Image generation returned no usable data");
 }
 
+// ─── Shared setup ─────────────────────────────────────────────────────────────
+
+interface PreparedChat {
+  user: Awaited<ReturnType<typeof User.findById>> & NonNullable<unknown>;
+  usingOwnKey: boolean;
+  limit: number | null;
+  now: Date;
+  resetInterval: number;
+  needsReset: boolean;
+  promptCount24h: number;
+  attachmentCount24h: number;
+  conversation: Awaited<ReturnType<typeof conversationService.findOrCreateConversation>>;
+  combinedMessage: string;
+  imageParts: ReturnType<typeof buildImageContentParts>;
+  userImageUrl: string | undefined;
+  apiKeyOverride: string | undefined;
+  provider: ReturnType<typeof getProvider>;
+  wantsImage: boolean;
+}
+
+/**
+ * Validates limits, fetches user, creates/finds conversation, and prepares all
+ * context needed to generate a reply. Shared between chat() and chatStream().
+ */
+async function prepareChat(
+  userId: string,
+  input: ChatInput,
+  files?: Express.Multer.File[],
+): Promise<PreparedChat> {
+  const user = await User.findById(userId).select(
+    "subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt apiKeys.provider",
+  );
+  if (!user) throw ApiError.unauthorized("User no longer exists");
+
+  const byokProvider = getByokProvider(input.model);
+  const usingOwnKey = user.apiKeys.some((entry) => entry.provider === byokProvider);
+  const limit = getPromptLimit(user.subscription);
+
+  const now = new Date();
+  const resetInterval = 30 * 24 * 60 * 60 * 1000;
+  const originalLastResetAt = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : null;
+  const needsReset = !originalLastResetAt || now.getTime() - originalLastResetAt.getTime() >= resetInterval;
+  const promptCount24h = needsReset ? 0 : (user.promptCount24h || 0);
+  const attachmentCount24h = needsReset ? 0 : (user.attachmentCount24h || 0);
+
+  if (!usingOwnKey) {
+    if (user.subscription === "free") {
+      if (user.promptCount >= (limit ?? 3))
+        throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
+      if (files && files.length > 0)
+        throw new ApiError(403, "File attachments are not allowed on the Free plan. Please upgrade to Standard or higher.");
+    } else {
+      if (limit !== null && promptCount24h + 1 > limit)
+        throw new ApiError(403, `Monthly prompt limit reached for your ${user.subscription} plan (${limit} prompts/month). Limit resets every 30 days.`);
+      const attachmentLimit = getAttachmentLimit(user.subscription);
+      if (attachmentCount24h + (files?.length ?? 0) > attachmentLimit)
+        throw new ApiError(403, `Monthly file attachment limit reached for your ${user.subscription} plan (${attachmentLimit} attachments).`);
+    }
+  }
+
+  const [attachmentContext, conversation, encryptedKey] = await Promise.all([
+    extractAttachmentContext(files, input.model),
+    conversationService.findOrCreateConversation(userId, input.model, input.message, input.conversationId),
+    usingOwnKey ? userService.getEncryptedApiKey(userId, byokProvider) : Promise.resolve(null),
+  ]);
+
+  const combinedMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
+  const wantsImage = isImageRequest(input.message);
+  const imageParts = buildImageContentParts(files);
+  const userImageUrl = imageParts[0]?.image_url.url;
+  const apiKeyOverride = encryptedKey ? decrypt(encryptedKey) : undefined;
+  const provider = getProvider(input.model);
+
+  if (wantsImage && !canGenerateImages(user.imagePlan) && !usingOwnKey)
+    throw new ApiError(403, "Image generation requires an Image Generation plan. Please subscribe to unlock it.");
+
+  if (wantsImage && !usingOwnKey) {
+    const imageLimit = getImageLimit(user.imagePlan);
+    const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
+    const imageCount = now.getTime() - lastImageReset.getTime() >= resetInterval ? 0 : (user.imageCount24h ?? 0);
+    if (imageCount >= imageLimit)
+      throw new ApiError(403, `Daily image limit reached for your plan (${imageLimit} images/day). Upgrade your Image Generation plan for more.`);
+  }
+
+  return {
+    user: user as NonNullable<typeof user>,
+    usingOwnKey, limit, now, resetInterval, needsReset,
+    promptCount24h, attachmentCount24h,
+    conversation, combinedMessage, imageParts, userImageUrl,
+    apiKeyOverride, provider, wantsImage,
+  };
+}
+
+/** Builds the counter update fields — shared between chat() and chatStream(). */
+function buildUpdateFields(
+  usingOwnKey: boolean,
+  subscription: string,
+  needsReset: boolean,
+  promptCount24h: number,
+  files?: Express.Multer.File[],
+  wantsImage = false,
+  lastImageResetAt?: Date,
+  now?: Date,
+  resetInterval?: number,
+  imageCount24h?: number,
+): Record<string, any> {
+  const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
+
+  if (!usingOwnKey) {
+    if (needsReset) {
+      updateFields.$set = {
+        promptCount24h: subscription === "free" ? (promptCount24h ?? 0) : 1,
+        attachmentCount24h: subscription === "free" ? 0 : (files?.length ?? 0),
+        lastPromptResetAt: now,
+      };
+    } else if (subscription !== "free") {
+      updateFields.$inc.promptCount24h = 1;
+      updateFields.$inc.attachmentCount24h = files?.length ?? 0;
+    }
+  }
+
+  if (wantsImage && !usingOwnKey && now && resetInterval !== undefined && lastImageResetAt !== undefined) {
+    const imageIsReset = now.getTime() - lastImageResetAt.getTime() >= resetInterval;
+    if (imageIsReset) {
+      updateFields.$set = { ...(updateFields.$set ?? {}), imageCount24h: 1, lastImageResetAt: now };
+    } else {
+      updateFields.$inc.imageCount24h = 1;
+    }
+  }
+
+  return updateFields;
+}
+
 export async function chat(userId: string, input: ChatInput, files?: Express.Multer.File[]) {
   const user = await User.findById(userId).select("subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt apiKeys.provider");
   if (!user) throw ApiError.unauthorized("User no longer exists");
@@ -308,7 +441,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   ]);
 
   // Touch conversation timestamp — not in critical path, fire-and-forget
-  conversationService.touchConversation(conversation.id as string);
+  void conversationService.touchConversation(conversation.id as string);
 
   const promptsUsed = usingOwnKey
     ? user.promptCount
@@ -446,7 +579,7 @@ export async function* chatStream(
     conversationService.appendMessage(conversation.id as string, "assistant", fullReply, input.model),
     User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
   ]);
-  conversationService.touchConversation(conversation.id as string);
+  void conversationService.touchConversation(conversation.id as string);
 
   const promptsUsed = usingOwnKey ? user.promptCount : (updatedUser?.promptCount ?? user.promptCount + 1);
   const promptsUsed24h = usingOwnKey ? (user.promptCount24h ?? 0) : (updatedUser?.promptCount24h ?? promptCount24h + 1);

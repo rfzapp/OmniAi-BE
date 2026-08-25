@@ -65,15 +65,13 @@ export async function getRecentMessages(conversationId: string, limit: number) {
   }));
 }
 
-export function touchConversation(conversationId: string): void {
-  // Fire-and-forget — nothing in the response path depends on this timestamp.
-  // Use $set with { timestamps: false } to force-update updatedAt even though
-  // Mongoose's timestamps option is active (it would otherwise ignore manual updates).
-  // eslint-disable-next-line @typescript-eslint/no-floating-promises
-  Conversation.findByIdAndUpdate(
-    conversationId,
+export async function touchConversation(conversationId: string): Promise<void> {
+  // Awaited to ensure the DB write completes before the response is sent.
+  // Using updateOne with strict:false and timestamps:false to bypass Mongoose's
+  // timestamp intercept which silently ignores manual updatedAt writes.
+  await Conversation.collection.updateOne(
+    { _id: new (require("mongoose").Types.ObjectId)(conversationId) },
     { $set: { updatedAt: new Date() } },
-    { timestamps: false },
   );
 }
 
