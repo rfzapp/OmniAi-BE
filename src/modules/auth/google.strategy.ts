@@ -27,10 +27,10 @@ export function setupGoogleStrategy() {
 
           if (!user) {
             user = await User.create({
-              fullName: profile.displayName || email.split("@")[0],
+              fullName: (profile.displayName || email.split("@")[0]) as string,
               email,
-              password: `google-oauth-${profile.id}`, // placeholder — never used for login
-              provider: "google",
+              password: `google-oauth-${profile.id}`,
+              provider: "google" as const,
               emailVerified: true,
             });
           } else if (user.provider !== "google") {
