@@ -44,6 +44,7 @@ const envSchema = z.object({
   // Google OAuth
   GOOGLE_CLIENT_ID: z.string().optional(),
   GOOGLE_CLIENT_SECRET: z.string().optional(),
+  GOOGLE_CALLBACK_URL: z.string().optional(),
 
   // Email (nodemailer) — required for forgot-password flow
   SMTP_HOST: z.string().optional(),

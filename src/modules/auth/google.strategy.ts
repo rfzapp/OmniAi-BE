@@ -15,7 +15,7 @@ export function setupGoogleStrategy() {
       {
         clientID: env.GOOGLE_CLIENT_ID,
         clientSecret: env.GOOGLE_CLIENT_SECRET,
-        callbackURL: `${env.FRONTEND_URL.split(",")[0]!.trim().replace(/:\d+$/, ":5000")}/api/auth/google/callback`,
+        callbackURL: env.GOOGLE_CALLBACK_URL ?? `http://localhost:5000/api/auth/google/callback`,
       },
       async (_accessToken, _refreshToken, profile, done) => {
         try {
