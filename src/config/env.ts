@@ -41,6 +41,10 @@ const envSchema = z.object({
 
   FRONTEND_URL: z.string().default("http://localhost:3000"),
 
+  // Google OAuth
+  GOOGLE_CLIENT_ID: z.string().optional(),
+  GOOGLE_CLIENT_SECRET: z.string().optional(),
+
   // Email (nodemailer) — required for forgot-password flow
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z.coerce.number().default(587),

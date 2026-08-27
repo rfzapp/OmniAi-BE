@@ -8,6 +8,18 @@ export const PROMPT_LIMITS: Record<SubscriptionPlan, number | null> = {
   ultra_pro: 1500,
 };
 
+/** Per-message character limit per plan. */
+export const PROMPT_CHAR_LIMITS: Record<SubscriptionPlan, number> = {
+  free: 2000,
+  standard: 2000,
+  pro: 2000,
+  ultra_pro: 8000,
+};
+
+export function getPromptCharLimit(plan: SubscriptionPlan): number {
+  return PROMPT_CHAR_LIMITS[plan];
+}
+
 /** Monthly image generation limits per image plan. */
 export const IMAGE_LIMITS: Record<ImagePlan, number> = {
   none: 0,

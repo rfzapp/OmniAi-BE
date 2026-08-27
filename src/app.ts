@@ -4,7 +4,9 @@ import helmet from "helmet";
 import morgan from "morgan";
 import compression from "compression";
 import cookieParser from "cookie-parser";
+import passport from "passport";
 import { env, isProduction } from "./config/env";
+import { setupGoogleStrategy } from "./modules/auth/google.strategy";
 import { notFoundMiddleware } from "./middlewares/notFound.middleware";
 import { errorMiddleware } from "./middlewares/error.middleware";
 import authRoutes from "./modules/auth/auth.routes";
@@ -32,6 +34,9 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 app.use(cookieParser());
+// Initialize passport and Google OAuth strategy
+setupGoogleStrategy();
+app.use(passport.initialize());
 app.use(compression({
   // Skip compression for SSE streaming routes — compression buffers the
   // entire response before sending, which kills token-by-token delivery.

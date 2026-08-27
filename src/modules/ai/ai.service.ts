@@ -1,5 +1,5 @@
 import { ApiError } from "../../utils/ApiError";
-import { getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit } from "../../config/plans";
+import { getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit, getPromptCharLimit } from "../../config/plans";
 import { decrypt } from "../../utils/encryption";
 import { User } from "../user/user.model";
 import * as userService from "../user/user.service";
@@ -314,6 +314,12 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const user = await User.findById(userId).select("subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt apiKeys.provider");
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
+  // Enforce per-message character limit based on plan
+  const charLimit = getPromptCharLimit(user.subscription);
+  if (input.message.length > charLimit) {
+    throw new ApiError(403, `Message exceeds the ${charLimit.toLocaleString()}-character limit for your plan. Upgrade to Ultra Pro for up to 8,000 characters per message.`);
+  }
+
   const byokProvider = getByokProvider(input.model);
   const usingOwnKey = user.apiKeys.some((entry) => entry.provider === byokProvider);
   const limit = getPromptLimit(user.subscription);
@@ -487,6 +493,12 @@ export async function* chatStream(
     "subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt apiKeys.provider",
   );
   if (!user) throw ApiError.unauthorized("User no longer exists");
+
+  // Enforce per-message character limit based on plan
+  const charLimit = getPromptCharLimit(user.subscription);
+  if (input.message.length > charLimit) {
+    throw new ApiError(403, `Message exceeds the ${charLimit.toLocaleString()}-character limit for your plan. Upgrade to Ultra Pro for up to 8,000 characters per message.`);
+  }
 
   const byokProvider = getByokProvider(input.model);
   const usingOwnKey = user.apiKeys.some((entry) => entry.provider === byokProvider);
