@@ -22,19 +22,10 @@ export const updateSettingsSchema = z
     connectedModelIds: z.array(z.string().min(1)).min(1, "At least one model must stay connected").optional(),
     notifications: notificationsSchema.optional(),
     privacy: privacySchema.optional(),
+    memoryEnabled: z.boolean().optional(),
   })
   .refine((data) => Object.keys(data).length > 0, {
     message: "At least one field must be provided",
   });
 
-export const addApiKeySchema = z.object({
-  provider: z.string().trim().min(1, "Provider is required"),
-  apiKey: z.string().trim().min(8, "API key looks too short"),
-});
-
-export const apiKeyProviderParamSchema = z.object({
-  provider: z.string().trim().min(1, "Provider is required"),
-});
-
 export type UpdateSettingsInput = z.infer<typeof updateSettingsSchema>;
-export type AddApiKeyInput = z.infer<typeof addApiKeySchema>;

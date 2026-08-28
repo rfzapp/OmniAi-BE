@@ -3,7 +3,11 @@ import { z } from "zod";
 export const updateProfileSchema = z
   .object({
     fullName: z.string().trim().min(2, "Full name must be at least 2 characters").optional(),
-    avatar: z.url("Avatar must be a valid URL").optional(),
+    // Accept both https URLs and base64 data URLs (for file uploads)
+    avatar: z.string().optional().refine(
+      (v) => !v || v.startsWith("data:image/") || /^https?:\/\/.+/.test(v),
+      { message: "Avatar must be a valid URL or image" }
+    ),
   })
   .refine((data) => Object.keys(data).length > 0, {
     message: "At least one field must be provided",

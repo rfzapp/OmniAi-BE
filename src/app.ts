@@ -14,6 +14,7 @@ import userRoutes from "./modules/user/user.routes";
 import aiRoutes from "./modules/ai/ai.routes";
 import conversationRoutes from "./modules/conversation/conversation.routes";
 import settingsRoutes from "./modules/settings/settings.routes";
+import memoryRoutes from "./modules/memory/memory.routes";
 
 const app = express();
 
@@ -56,6 +57,7 @@ app.use("/api/user", userRoutes);
 app.use("/api/ai", aiRoutes);
 app.use("/api/conversations", conversationRoutes);
 app.use("/api/settings", settingsRoutes);
+app.use("/api/memories", memoryRoutes);
 
 app.use(notFoundMiddleware);
 app.use(errorMiddleware);

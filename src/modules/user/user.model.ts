@@ -13,12 +13,12 @@ export interface IPrivacyPrefs {
   shareUsageAnalytics: boolean;
 }
 
-export interface IApiKeyEntry {
-  provider: string;
-  maskedKey: string;
-  encryptedKey: string;
+export interface IMemoryEntry {
+  id: string;
+  content: string;
   createdAt: Date;
 }
+
 
 // Mirrors the frontend's AI_MODELS catalog (src/features/models/data/models.ts) —
 // the default "everything connected" state for a new user.
@@ -58,8 +58,9 @@ export interface IUser {
     connectedModelIds: string[];
     notifications: INotificationPrefs;
     privacy: IPrivacyPrefs;
+    memoryEnabled: boolean;
   };
-  apiKeys: IApiKeyEntry[];
+  memories: IMemoryEntry[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -164,13 +165,12 @@ const userSchema = new Schema<IUser, UserModel, IUserMethods>(
         improveModel: { type: Boolean, default: false },
         shareUsageAnalytics: { type: Boolean, default: true },
       },
+      memoryEnabled: { type: Boolean, default: true },
     },
-    apiKeys: {
+    memories: {
       type: [
         {
-          provider: { type: String, required: true },
-          maskedKey: { type: String, required: true },
-          encryptedKey: { type: String, required: true, select: false },
+          content: { type: String, required: true, trim: true },
           createdAt: { type: Date, default: Date.now },
         },
       ],
@@ -195,8 +195,13 @@ userSchema.set("toJSON", {
     delete (ret as { password?: string }).password;
     delete (ret as { __v?: number }).__v;
     delete (ret as { _id?: unknown })._id;
-    const apiKeys = (ret as { apiKeys?: { encryptedKey?: string }[] }).apiKeys;
-    apiKeys?.forEach((entry) => delete entry.encryptedKey);
+    if (Array.isArray(ret.memories)) {
+      ret.memories = ret.memories.map((m: any) => ({
+        id: m._id ? String(m._id) : String(m.id),
+        content: m.content,
+        createdAt: m.createdAt,
+      }));
+    }
     return ret;
   },
 });
