@@ -55,26 +55,32 @@ export const anthropicProvider: AIProvider = {
     }
   },
 
-  async *generateStream(model, messages, apiKeyOverride) {
-    const client = getAnthropicClient(apiKeyOverride);
-    const systemMsg = messages.find((m) => m.role === "system");
-    const system = systemMsg
-      ? typeof systemMsg.content === "string" ? systemMsg.content : undefined
-      : undefined;
+  async *generateStream(model, messages, apiKeyOverride, signal) {
+    yield { type: "start" as const };
+    try {
+      const client = getAnthropicClient(apiKeyOverride);
+      const systemMsg = messages.find((m) => m.role === "system");
+      const system = systemMsg
+        ? typeof systemMsg.content === "string" ? systemMsg.content : undefined
+        : undefined;
 
-    const stream = await client.messages.stream({
-      model,
-      max_tokens: MAX_TOKENS,
-      ...(system ? { system } : {}),
-      messages: toAnthropicMessages(messages),
-    });
-    for await (const event of stream) {
-      if (
-        event.type === "content_block_delta" &&
-        event.delta.type === "text_delta"
-      ) {
-        yield event.delta.text;
+      const stream = await client.messages.stream({
+        model,
+        max_tokens: MAX_TOKENS,
+        ...(system ? { system } : {}),
+        messages: toAnthropicMessages(messages),
+      }, { signal });
+      for await (const event of stream) {
+        if (
+          event.type === "content_block_delta" &&
+          event.delta.type === "text_delta"
+        ) {
+          yield { type: "token" as const, content: event.delta.text };
+        }
       }
+      yield { type: "done" as const };
+    } catch (err: any) {
+      yield { type: "error" as const, content: err?.message || String(err) };
     }
   },
 };

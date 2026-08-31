@@ -55,17 +55,17 @@ export async function chatStreamHandler(req: Request, res: Response) {
     }
   }
 
+  const abortController = new AbortController();
+  req.on("close", () => {
+    console.log("[CHAT] Client disconnected, request cancelled");
+    abortController.abort();
+  });
+
   try {
-    const generator = aiService.chatStream(req.user.id, req.body, files);
+    const generator = aiService.chatStream(req.user.id, req.body, files, abortController.signal);
 
     for await (const chunk of generator) {
-      if (typeof chunk === "string") {
-        // Token chunk
-        sendEvent({ token: chunk });
-      } else {
-        // Final done event with conversation/message/usage metadata
-        sendEvent(chunk);
-      }
+      sendEvent(chunk);
     }
   } catch (err) {
     const apiErr = err instanceof ApiError ? err : null;
