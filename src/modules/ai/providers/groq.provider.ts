@@ -11,9 +11,22 @@ function getClient(apiKeyOverride?: string): OpenAI {
 }
 
 function toMessages(messages: ProviderChatMessage[]): ChatCompletionMessageParam[] {
-  return messages
-    .filter((m) => m.role !== "system" || typeof m.content === "string")
-    .map((m) => ({ role: m.role, content: toTextContent(m.content) })) as ChatCompletionMessageParam[];
+  // xAI requires strictly alternating user/assistant turns.
+  // Merge any consecutive same-role messages to avoid context being dropped.
+  const filtered = messages.filter((m) => m.role === "user" || m.role === "assistant");
+  const merged: ProviderChatMessage[] = [];
+  for (const m of filtered) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === m.role) {
+      // Merge into previous message
+      const prevText = toTextContent(last.content);
+      const currText = toTextContent(m.content);
+      last.content = `${prevText}\n${currText}`;
+    } else {
+      merged.push({ ...m });
+    }
+  }
+  return merged.map((m) => ({ role: m.role, content: toTextContent(m.content) })) as ChatCompletionMessageParam[];
 }
 
 export const groqProvider: AIProvider = {

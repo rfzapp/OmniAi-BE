@@ -22,7 +22,6 @@ export const updateSettingsSchema = z
     connectedModelIds: z.array(z.string().min(1)).min(1, "At least one model must stay connected").optional(),
     notifications: notificationsSchema.optional(),
     privacy: privacySchema.optional(),
-    memoryEnabled: z.boolean().optional(),
   })
   .refine((data) => Object.keys(data).length > 0, {
     message: "At least one field must be provided",

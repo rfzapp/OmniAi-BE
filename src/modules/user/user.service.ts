@@ -43,7 +43,6 @@ export async function updatePreferences(userId: string, input: UpdateSettingsInp
   if (input.defaultModel !== undefined) setOps["preferences.defaultModel"] = input.defaultModel;
   if (input.theme !== undefined) setOps["preferences.theme"] = input.theme;
   if (input.connectedModelIds !== undefined) setOps["preferences.connectedModelIds"] = input.connectedModelIds;
-  if (input.memoryEnabled !== undefined) setOps["preferences.memoryEnabled"] = input.memoryEnabled;
 
   if (input.notifications) {
     for (const [key, value] of Object.entries(input.notifications)) {
