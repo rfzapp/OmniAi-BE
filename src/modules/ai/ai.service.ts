@@ -10,9 +10,12 @@ import { qwenProvider } from "./providers/qwen.provider";
 import { mistralProvider } from "./providers/mistral.provider";
 import { kimiProvider } from "./providers/kimi.provider";
 import { getOpenAIClient } from "../../config/openai";
+import type { AIStreamChunk } from "./providers/provider.types";
+
 import { supportsVision } from "../../config/capabilities";
 import type { ChatInput } from "./ai.validation";
 import type { ProviderChatMessage } from "./providers/provider.types";
+import { LatencyTimer } from "../../utils/latencyTimer";
 
 const HISTORY_LIMIT = 20;
 
@@ -288,6 +291,8 @@ function buildUpdateFields(
 }
 
 export async function chat(userId: string, input: ChatInput, files?: Express.Multer.File[]) {
+  const timer = new LatencyTimer('chat');
+  timer.start();
   const user = await User.findById(userId).select("subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt preferences.memoryEnabled memories");
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
@@ -453,10 +458,19 @@ export async function* chatStream(
   userId: string,
   input: ChatInput,
   files?: Express.Multer.File[],
-): AsyncGenerator<string | { done: true; conversation: object; message: object; usage: object }> {
+  signal?: AbortSignal,
+): AsyncGenerator<import("./providers/provider.types").AIStreamChunk | { done: true; conversation: object; message: object; usage: object }> {
+  const tTotal = new LatencyTimer("Total");
+  tTotal.start();
+
+  const tUser = new LatencyTimer("User lookup");
+  tUser.start();
   const user = await User.findById(userId).select(
     "subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt preferences.memoryEnabled memories",
   );
+  tUser.stop();
+  console.log(`[CHAT] ${tUser.report()}`);
+
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
   // Enforce per-message character limit based on plan
@@ -491,9 +505,26 @@ export async function* chatStream(
       throw new ApiError(403, `Monthly file attachment limit reached for your ${user.subscription} plan (${attachmentLimit} attachments).`);
   }
 
+  const tAttachment = new LatencyTimer("Attachment processing");
+  const tConversation = new LatencyTimer("Conversation lookup/create");
+  
+  tAttachment.start();
+  const attachmentContextPromise = extractAttachmentContext(files, input.model).then(res => {
+    tAttachment.stop();
+    console.log(`[CHAT] ${tAttachment.report()}`);
+    return res;
+  });
+
+  tConversation.start();
+  const conversationPromise = conversationService.findOrCreateConversation(userId, input.model, input.message, input.conversationId).then(res => {
+    tConversation.stop();
+    console.log(`[CHAT] ${tConversation.report()}`);
+    return res;
+  });
+
   const [attachmentContext, conversation] = await Promise.all([
-    extractAttachmentContext(files, input.model),
-    conversationService.findOrCreateConversation(userId, input.model, input.message, input.conversationId),
+    attachmentContextPromise,
+    conversationPromise,
   ]);
 
   const memoryContext = buildMemoryContext(user);
@@ -502,11 +533,21 @@ export async function* chatStream(
   const userImageUrl = imageParts[0]?.image_url.url;
   const provider = getProvider(input.model);
 
+  const tContext = new LatencyTimer("Context construction");
+  tContext.start();
+
   // Append user message and fetch history in parallel — history fetch doesn't
   // need the user message to exist yet since it was just created this turn.
+  const tHistory = new LatencyTimer("History fetch");
+  tHistory.start();
+
   const [, history] = await Promise.all([
     conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
-    conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT),
+    conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT).then(res => {
+      tHistory.stop();
+      console.log(`[CHAT] ${tHistory.report()}`);
+      return res;
+    }),
   ]);
 
   const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
@@ -525,12 +566,41 @@ export async function* chatStream(
     }
   }
 
+  tContext.stop();
+  console.log(`[CHAT] ${tContext.report()}`);
+
+  const providerName = ((input.model || "").split('-')[0] ?? "").toUpperCase();
+  console.log(`\n[${providerName}] Request started`);
+  
+  const tProvider = new LatencyTimer("Provider stream");
+  tProvider.start();
+  
+  const tTTFT = new LatencyTimer("TTFT");
+  tTTFT.start();
+
   // Stream tokens to the caller
   let fullReply = "";
-  for await (const token of provider.generateStream(input.model, providerMessages)) {
-    fullReply += token;
-    yield token;
+  let firstToken = true;
+  
+  yield { type: "start", conversationId: conversation.id } as unknown as AIStreamChunk;
+
+  for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
+    if (chunk.type === "start") continue;
+    
+    if (chunk.type === "token" && firstToken) {
+      tTTFT.stop();
+      console.log(`[${providerName}] First chunk: ${tTTFT.elapsed()}ms`);
+      console.log(`[CHAT] TTFT: ${tTotal.elapsed()}ms`);
+      firstToken = false;
+    }
+    if (chunk.type === "token" && chunk.content) {
+      fullReply += chunk.content;
+    }
+    yield chunk;
   }
+  
+  tProvider.stop();
+  console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
 
   // Persist + update counters after streaming completes
   const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
@@ -577,4 +647,7 @@ export async function* chatStream(
       promptsLimit: limit,
     },
   };
+  
+  tTotal.stop();
+  console.log(`[CHAT] ${tTotal.report()}\n`);
 }

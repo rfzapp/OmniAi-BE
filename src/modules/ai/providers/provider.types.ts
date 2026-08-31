@@ -20,9 +20,15 @@ export interface ProviderChatMessage {
   content: string | ProviderContentPart[];
 }
 
+export interface AIStreamChunk {
+  type: "start" | "token" | "done" | "error";
+  content?: string;
+  metadata?: unknown;
+}
+
 export interface AIProvider {
   /** Returns the full response text (non-streaming fallback). */
   generateReply(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string): Promise<string>;
-  /** Streams tokens via async generator. Each yielded string is a token chunk. */
-  generateStream(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string): AsyncGenerator<string>;
+  /** Streams normalized tokens via async generator. */
+  generateStream(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string, signal?: AbortSignal): AsyncGenerator<AIStreamChunk>;
 }

@@ -26,11 +26,17 @@ export const mistralProvider: AIProvider = {
     }
   },
 
-  async *generateStream(model, messages, apiKeyOverride) {
-    const stream = await getClient(apiKeyOverride).chat.completions.create({ model, messages: toMessages(messages), stream: true });
-    for await (const chunk of stream) {
-      const token = chunk.choices[0]?.delta?.content;
-      if (token) yield token;
+  async *generateStream(model, messages, apiKeyOverride, signal) {
+    yield { type: "start" };
+    try {
+      const stream = await getClient(apiKeyOverride).chat.completions.create({ model, messages: toMessages(messages), stream: true }, { signal });
+      for await (const chunk of stream) {
+        const token = chunk.choices[0]?.delta?.content;
+        if (token) yield { type: "token", content: token };
+      }
+      yield { type: "done" };
+    } catch (err: any) {
+      yield { type: "error", content: err?.message || String(err) };
     }
   },
 };

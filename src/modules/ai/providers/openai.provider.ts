@@ -64,16 +64,22 @@ export const openaiProvider: AIProvider = {
     }
   },
 
-  async *generateStream(model, messages, apiKeyOverride) {
-    const client = getOpenAIClient(apiKeyOverride);
-    const stream = await client.chat.completions.create({
-      model,
-      messages: toOpenAIMessages(messages),
-      stream: true,
-    });
-    for await (const chunk of stream) {
-      const token = chunk.choices[0]?.delta?.content;
-      if (token) yield token;
+  async *generateStream(model, messages, apiKeyOverride, signal) {
+    yield { type: "start" };
+    try {
+      const client = getOpenAIClient(apiKeyOverride);
+      const stream = await client.chat.completions.create({
+        model,
+        messages: toOpenAIMessages(messages),
+        stream: true,
+      }, { signal });
+      for await (const chunk of stream) {
+        const token = chunk.choices[0]?.delta?.content;
+        if (token) yield { type: "token", content: token };
+      }
+      yield { type: "done" };
+    } catch (err: any) {
+      yield { type: "error", content: err?.message || String(err) };
     }
   },
 };
