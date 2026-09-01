@@ -358,11 +358,14 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   };
 }
 
+
+
 /**
  * SSE streaming variant of chat().
- * Validates limits and sets up the conversation synchronously,
- * then yields tokens as they arrive from the AI provider.
- * Yields string tokens first, then a final object with conversation/usage metadata.
+ * Validates limits, creates the conversation, then streams tokens from the
+ * AI provider. Any error — pre-stream, mid-stream, or provider failure — is
+ * captured and persisted as the assistant message so page-reload always shows
+ * the same text as the live session.
  */
 export async function* chatStream(
   userId: string,
@@ -373,6 +376,7 @@ export async function* chatStream(
   const tTotal = new LatencyTimer("Total");
   tTotal.start();
 
+  // ── 1. Auth + limits (throw before any yield — controller handles these) ──
   const tUser = new LatencyTimer("User lookup");
   tUser.start();
   const user = await User.findById(userId).select(
@@ -383,26 +387,22 @@ export async function* chatStream(
 
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
-  // Enforce per-message character limit based on plan
   const charLimit = getPromptCharLimit(user.subscription);
   if (input.message.length > charLimit) {
     throw new ApiError(403, `Message exceeds the ${charLimit.toLocaleString()}-character limit for your plan. Upgrade to Ultra Pro for up to 8,000 characters per message.`);
   }
 
   const limit = getPromptLimit(user.subscription);
-
   const now = new Date();
   const resetInterval = 30 * 24 * 60 * 60 * 1000;
   const originalLastResetAt = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : null;
   const needsReset = !originalLastResetAt || now.getTime() - originalLastResetAt.getTime() >= resetInterval;
-
   const promptCount24h = needsReset ? 0 : (user.promptCount24h || 0);
   const attachmentCount24h = needsReset ? 0 : (user.attachmentCount24h || 0);
 
-  const freePromptLimit = limit ?? 3;
   if (user.subscription === "free") {
-    // Free plan uses promptCount (all-time lifetime total) — 3 prompts forever, no reset
-    if (user.promptCount >= freePromptLimit)
+    const freeLimit = limit ?? 3;
+    if (user.promptCount >= freeLimit)
       throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
     if (files && files.length > 0)
       throw new ApiError(403, "File attachments are not allowed on the Free plan. Please upgrade to Standard or higher.");
@@ -416,69 +416,71 @@ export async function* chatStream(
       throw new ApiError(403, `Monthly file attachment limit reached for your ${user.subscription} plan (${attachmentLimit} attachments).`);
   }
 
+  // ── 2. Create conversation + kick off attachment processing in parallel ────
+  // Attachment processing (PDF text extraction, image base64) can be slow.
+  // We await the conversation first so we can emit the "start" SSE event with
+  // the conversationId immediately, giving the frontend the ID even if the
+  // client disconnects during attachment extraction.
   const tAttachment = new LatencyTimer("Attachment processing");
   const tConversation = new LatencyTimer("Conversation lookup/create");
-  
+
   tAttachment.start();
-  const attachmentContextPromise = extractAttachmentContext(files, input.model).then(res => {
+  const attachmentContextPromise = extractAttachmentContext(files, input.model).then((res) => {
     tAttachment.stop();
     console.log(`[CHAT] ${tAttachment.report()}`);
     return res;
   });
 
   tConversation.start();
-  const conversation = await conversationService.findOrCreateConversation(userId, input.model, input.message, input.conversationId).then(res => {
-    tConversation.stop();
-    console.log(`[CHAT] ${tConversation.report()}`);
-    return res;
-  });
+  const conversation = await conversationService
+    .findOrCreateConversation(userId, input.model, input.message, input.conversationId)
+    .then((res) => {
+      tConversation.stop();
+      console.log(`[CHAT] ${tConversation.report()}`);
+      return res;
+    });
 
-  // Emit "start" immediately now that we have a conversationId — the frontend
-  // uses this to register the new chat before any tokens arrive.
+  // Emit start immediately — frontend registers conversationId from this event.
   yield { type: "start", conversationId: conversation.id } as unknown as AIStreamChunk;
 
-  // Everything from here on runs inside a try/catch so that any error —
-  // whether from attachment processing, the provider, or mid-stream — is
-  // persisted as the assistant message. This guarantees the exact same error
-  // text shows on page reload as was displayed in the live session.
+  // ── 3. Stream + persist ───────────────────────────────────────────────────
+  // Everything from here is wrapped in try/catch. Any error is stored as the
+  // assistant message so reload shows the same text as the live session.
   const FALLBACK_ERROR = "Something went wrong. Please try again.";
   let fullReply = "";
   let streamError: string | null = null;
 
   try {
-    // Now wait for attachment processing to finish (may already be done).
+    // Wait for attachment extraction (may already be done).
     const attachmentContext = await attachmentContextPromise;
 
-  const memoryContext = buildMemoryContext(user);
-  const combinedMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
-  const imageParts = buildImageContentParts(files);
-  const userImageUrl = imageParts[0]?.image_url.url;
-  const provider = getProvider(input.model);
+    const memoryContext = buildMemoryContext(user);
+    const combinedMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
+    const imageParts = buildImageContentParts(files);
+    const userImageUrl = imageParts[0]?.image_url.url;
+    const provider = getProvider(input.model);
 
     const tContext = new LatencyTimer("Context construction");
     tContext.start();
 
-    // Append user message and fetch history in parallel — history fetch doesn't
-    // need the user message to exist yet since it was just created this turn.
+    // Save user message and fetch recent history in parallel.
     const tHistory = new LatencyTimer("History fetch");
     tHistory.start();
+    const [, history] = await Promise.all([
+      conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
+      conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT).then((res) => {
+        tHistory.stop();
+        console.log(`[CHAT] ${tHistory.report()}`);
+        return res;
+      }),
+    ]);
 
-  const [, history] = await Promise.all([
-    conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
-    conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT).then(res => {
-      tHistory.stop();
-      console.log(`[CHAT] ${tHistory.report()}`);
-      return res;
-    }),
-  ]);
-
+    // Build provider messages — include the current user turn which may not
+    // be in the history yet (saved in parallel above).
     const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
-
-  // Add the current user message (appended in parallel so may not be in history yet)
-  providerMessages.push({ role: "user", content: combinedMessage });
+    providerMessages.push({ role: "user", content: combinedMessage });
 
     if (imageParts.length > 0) {
-      // The last message is always the current user message we just pushed
       const lastUser = providerMessages[providerMessages.length - 1];
       if (lastUser && lastUser.role === "user") {
         const textContent = String(lastUser.content || "").trim();
@@ -491,42 +493,48 @@ export async function* chatStream(
     tContext.stop();
     console.log(`[CHAT] ${tContext.report()}`);
 
-  const providerName = ((input.model || "").split('-')[0] ?? "").toUpperCase();
-  console.log(`\n[${providerName}] Request started`);
-  
-  const tProvider = new LatencyTimer("Provider stream");
-  tProvider.start();
-  
-  const tTTFT = new LatencyTimer("TTFT");
-  tTTFT.start();
+    const providerName = ((input.model || "").split("-")[0] ?? "").toUpperCase();
+    console.log(`\n[${providerName}] Request started`);
 
-  // Stream tokens to the caller
-  let fullReply = "";
-  let firstToken = true;
-  
-  yield { type: "start", conversationId: conversation.id } as unknown as AIStreamChunk;
+    const tProvider = new LatencyTimer("Provider stream");
+    tProvider.start();
+    const tTTFT = new LatencyTimer("TTFT");
+    tTTFT.start();
+    let firstToken = true;
 
-  for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
-    if (chunk.type === "start") continue;
-    
-    if (chunk.type === "token" && firstToken) {
-      tTTFT.stop();
-      console.log(`[${providerName}] First chunk: ${tTTFT.elapsed()}ms`);
-      console.log(`[CHAT] TTFT: ${tTotal.elapsed()}ms`);
-      firstToken = false;
+    try {
+      for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
+        if (chunk.type === "start") continue;
+
+        if (chunk.type === "error") {
+          // Provider yielded an error chunk — capture and stop consuming.
+          streamError = (chunk as any).content ?? "AI provider error during streaming";
+          break;
+        }
+
+        if (chunk.type === "token" && firstToken) {
+          tTTFT.stop();
+          console.log(`[${providerName}] First chunk: ${tTTFT.elapsed()}ms`);
+          console.log(`[CHAT] TTFT: ${tTotal.elapsed()}ms`);
+          firstToken = false;
+        }
+        if (chunk.type === "token" && chunk.content) {
+          fullReply += chunk.content;
+        }
+        yield chunk;
+      }
+    } catch (genErr: any) {
+      // for-await threw directly (e.g. AbortError before provider caught it).
+      if (!streamError) {
+        streamError = genErr?.message || "Stream interrupted";
+      }
     }
-    if (chunk.type === "token" && chunk.content) {
-      fullReply += chunk.content;
-    }
-    yield chunk;
-  }
-  
-  tProvider.stop();
-  console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
+
+    tProvider.stop();
+    console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
 
   } catch (preStreamErr: any) {
-    // An error occurred before or during setup (attachment processing, DB write,
-    // unsupported model, etc.). Capture so it gets persisted below.
+    // Attachment processing, DB write, unsupported model, etc.
     if (!streamError) {
       streamError = preStreamErr instanceof ApiError
         ? preStreamErr.message
@@ -534,29 +542,27 @@ export async function* chatStream(
     }
   }
 
-  // Persist the actual error message (or successful reply) so it shows
-  // correctly on page reload — same text the user saw in the live session.
-  const contentToSave = fullReply.trim() || (streamError !== null ? (streamError.trim() || FALLBACK_ERROR) : fullReply);
+  // ── 4. Persist assistant message ──────────────────────────────────────────
+  // contentToSave is:
+  //   • fullReply       — the real AI response (success, or partial on abort)
+  //   • streamError     — the exact error text the user saw live  
+  //   • FALLBACK_ERROR  — last resort when error message was empty
+  const contentToSave = fullReply.trim() || (streamError !== null ? (streamError.trim() || FALLBACK_ERROR) : "");
 
-  // Persist + update counters after streaming completes (or fails).
-  // This always runs regardless of streaming outcome so page-reload always
-  // has an assistant message to display.
   const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
-  if (user.subscription !== "free") {
-    if (needsReset) {
-      updateFields.$set = {
-        promptCount24h: 1,
-        attachmentCount24h: files ? files.length : 0,
-        lastPromptResetAt: now,
-      };
-    } else {
-      updateFields.$inc.promptCount24h = 1;
-      updateFields.$inc.attachmentCount24h = files ? files.length : 0;
-    }
+  if (needsReset) {
+    updateFields.$set = {
+      promptCount24h: user.subscription === "free" ? (user.promptCount24h ?? 0) : 1,
+      attachmentCount24h: user.subscription === "free" ? 0 : (files ? files.length : 0),
+      lastPromptResetAt: now,
+    };
+  } else if (user.subscription !== "free") {
+    updateFields.$inc.promptCount24h = 1;
+    updateFields.$inc.attachmentCount24h = files ? files.length : 0;
   }
 
   const [assistantMessage, updatedUser] = await Promise.all([
-    conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, input.model),
+    conversationService.appendMessage(conversation.id as string, "assistant", contentToSave || FALLBACK_ERROR, input.model),
     User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
   ]);
   void conversationService.touchConversation(conversation.id as string);
@@ -564,10 +570,10 @@ export async function* chatStream(
   const promptsUsed = updatedUser?.promptCount ?? user.promptCount + 1;
   const promptsUsed24h = updatedUser?.promptCount24h ?? promptCount24h + 1;
 
-  // If streaming errored, send the SSE error event now (after persisting) so
-  // the client shows a proper error message in the live session while the DB
-  // has the fallback sentinel for page-reload display.
+  // ── 5. Final SSE event ────────────────────────────────────────────────────
   if (streamError !== null) {
+    // Send error event so the live session shows the real error text.
+    // The DB already has the same text for reload.
     yield {
       error: true,
       status: 502,
