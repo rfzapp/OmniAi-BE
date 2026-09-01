@@ -98,23 +98,45 @@ async function extractAttachmentContext(files: Express.Multer.File[] | undefined
       let text = "";
 
       if (mime === "application/pdf" || lower.endsWith(".pdf")) {
-        text = await extractPdfText(file.buffer);
+        try {
+          text = await extractPdfText(file.buffer);
+        } catch {
+          text = "";
+        }
       } else if (
         mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
         mime === "application/msword" ||
         lower.endsWith(".docx") ||
         lower.endsWith(".doc")
       ) {
-        text = await extractDocxText(file.buffer);
+        try {
+          text = await extractDocxText(file.buffer);
+        } catch {
+          text = "";
+        }
       } else if (
         mime === "application/vnd.ms-excel" ||
         mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
         lower.endsWith(".xls") ||
-        lower.endsWith(".xlsx")
+        lower.endsWith(".xlsx") ||
+        lower.endsWith(".csv")
       ) {
-        text = extractXlsxText(file.buffer);
+        try {
+          text = extractXlsxText(file.buffer);
+        } catch {
+          text = file.buffer.toString("utf-8");
+        }
+      } else if (
+        mime.startsWith("text/") ||
+        mime === "application/json" ||
+        mime === "application/javascript" ||
+        mime === "application/xml" ||
+        /\.(txt|csv|json|md|ts|tsx|js|jsx|py|html|css|xml|log|yaml|yml|sh|c|cpp|h|java|sql)$/i.test(lower)
+      ) {
+        text = file.buffer.toString("utf-8");
       } else {
-        throw ApiError.badRequest(`Unsupported attachment type: ${name}`);
+        // Fallback: try reading as UTF-8 string for general files
+        text = file.buffer.toString("utf-8");
       }
 
       if (!text.trim()) {
@@ -168,128 +190,6 @@ async function generateImage(prompt: string, apiKeyOverride?: string): Promise<s
   throw ApiError.internal("Image generation returned no usable data");
 }
 
-// ─── Shared setup ─────────────────────────────────────────────────────────────
-
-interface PreparedChat {
-  user: Awaited<ReturnType<typeof User.findById>> & NonNullable<unknown>;
-  limit: number | null;
-  now: Date;
-  resetInterval: number;
-  needsReset: boolean;
-  promptCount24h: number;
-  attachmentCount24h: number;
-  conversation: Awaited<ReturnType<typeof conversationService.findOrCreateConversation>>;
-  combinedMessage: string;
-  imageParts: ReturnType<typeof buildImageContentParts>;
-  userImageUrl: string | undefined;
-  provider: ReturnType<typeof getProvider>;
-  wantsImage: boolean;
-}
-
-/**
- * Validates limits, fetches user, creates/finds conversation, and prepares all
- * context needed to generate a reply. Shared between chat() and chatStream().
- */
-async function prepareChat(
-  userId: string,
-  input: ChatInput,
-  files?: Express.Multer.File[],
-): Promise<PreparedChat> {
-  const user = await User.findById(userId).select(
-    "subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt",
-  );
-  if (!user) throw ApiError.unauthorized("User no longer exists");
-
-  const limit = getPromptLimit(user.subscription);
-
-  const now = new Date();
-  const resetInterval = 30 * 24 * 60 * 60 * 1000;
-  const originalLastResetAt = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : null;
-  const needsReset = !originalLastResetAt || now.getTime() - originalLastResetAt.getTime() >= resetInterval;
-  const promptCount24h = needsReset ? 0 : (user.promptCount24h || 0);
-  const attachmentCount24h = needsReset ? 0 : (user.attachmentCount24h || 0);
-
-  if (user.subscription === "free") {
-    if (user.promptCount >= (limit ?? 3))
-      throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
-    if (files && files.length > 0)
-      throw new ApiError(403, "File attachments are not allowed on the Free plan. Please upgrade to Standard or higher.");
-  } else {
-    if (limit !== null && promptCount24h + 1 > limit)
-      throw new ApiError(403, `Monthly prompt limit reached for your ${user.subscription} plan (${limit} prompts/month). Limit resets every 30 days.`);
-    const attachmentLimit = getAttachmentLimit(user.subscription);
-    if (attachmentCount24h + (files?.length ?? 0) > attachmentLimit)
-      throw new ApiError(403, `Monthly file attachment limit reached for your ${user.subscription} plan (${attachmentLimit} attachments).`);
-  }
-
-  const [attachmentContext, conversation] = await Promise.all([
-    extractAttachmentContext(files, input.model),
-    conversationService.findOrCreateConversation(userId, input.model, input.message, input.conversationId),
-  ]);
-
-  const combinedMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
-  const wantsImage = isImageRequest(input.message);
-  const imageParts = buildImageContentParts(files);
-  const userImageUrl = imageParts[0]?.image_url.url;
-  const provider = getProvider(input.model);
-
-  if (wantsImage && !canGenerateImages(user.imagePlan))
-    throw new ApiError(403, "Image generation requires an Image Generation plan. Please subscribe to unlock it.");
-
-  if (wantsImage) {
-    const imageLimit = getImageLimit(user.imagePlan);
-    const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
-    const imageCount = now.getTime() - lastImageReset.getTime() >= resetInterval ? 0 : (user.imageCount24h ?? 0);
-    if (imageCount >= imageLimit)
-      throw new ApiError(403, `Daily image limit reached for your plan (${imageLimit} images/day). Upgrade your Image Generation plan for more.`);
-  }
-
-  return {
-    user: user as NonNullable<typeof user>,
-    limit, now, resetInterval, needsReset,
-    promptCount24h, attachmentCount24h,
-    conversation, combinedMessage, imageParts, userImageUrl,
-    provider, wantsImage,
-  };
-}
-
-/** Builds the counter update fields — shared between chat() and chatStream(). */
-function buildUpdateFields(
-  subscription: string,
-  needsReset: boolean,
-  promptCount24h: number,
-  files?: Express.Multer.File[],
-  wantsImage = false,
-  lastImageResetAt?: Date,
-  now?: Date,
-  resetInterval?: number,
-  imageCount24h?: number,
-): Record<string, any> {
-  const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
-
-  if (needsReset) {
-    updateFields.$set = {
-      promptCount24h: subscription === "free" ? (promptCount24h ?? 0) : 1,
-      attachmentCount24h: subscription === "free" ? 0 : (files?.length ?? 0),
-      lastPromptResetAt: now,
-    };
-  } else if (subscription !== "free") {
-    updateFields.$inc.promptCount24h = 1;
-    updateFields.$inc.attachmentCount24h = files?.length ?? 0;
-  }
-
-  if (wantsImage && now && resetInterval !== undefined && lastImageResetAt !== undefined) {
-    const imageIsReset = now.getTime() - lastImageResetAt.getTime() >= resetInterval;
-    if (imageIsReset) {
-      updateFields.$set = { ...(updateFields.$set ?? {}), imageCount24h: 1, lastImageResetAt: now };
-    } else {
-      updateFields.$inc.imageCount24h = 1;
-    }
-  }
-
-  return updateFields;
-}
-
 export async function chat(userId: string, input: ChatInput, files?: Express.Multer.File[]) {
   const timer = new LatencyTimer('chat');
   timer.start();
@@ -305,15 +205,17 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const limit = getPromptLimit(user.subscription);
 
   const now = new Date();
-  const resetInterval = 30 * 24 * 60 * 60 * 1000; // 30-day monthly window
+  const resetInterval = 30 * 24 * 60 * 60 * 1000; // 30-day rolling window
   const originalLastResetAt = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : null;
   const needsReset = !originalLastResetAt || (now.getTime() - originalLastResetAt.getTime() >= resetInterval);
 
-  let promptCount24h = needsReset ? 0 : (user.promptCount24h || 0);
+  // After a reset, counters restart from 0 for limit-checking purposes
+  const promptCount24h = needsReset ? 0 : (user.promptCount24h || 0);
   let attachmentCount24h = needsReset ? 0 : (user.attachmentCount24h || 0);
 
+  const freePromptLimit = limit ?? 3;
   if (user.subscription === "free") {
-    const freePromptLimit = limit ?? 3;
+    // Free plan uses promptCount (all-time lifetime total) — 3 prompts forever, no reset
     if (user.promptCount >= freePromptLimit) {
       throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
     }
@@ -340,7 +242,8 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   ]);
 
   const memoryContext = buildMemoryContext(user);
-  const combinedMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
+  const dbUserMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
+  const aiPromptMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
 
   const wantsImage = isImageRequest(input.message);
 
@@ -355,7 +258,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
       ? 0
       : (user.imageCount24h ?? 0);
     if (imageCount >= imageLimit) {
-      throw new ApiError(403, `Daily image limit reached for your plan (${imageLimit} images/day). Upgrade your Image Generation plan for more.`);
+      throw new ApiError(403, `Monthly image limit reached for your plan (${imageLimit} images/month). Upgrade your Image Generation plan for more.`);
     }
   }
 
@@ -364,8 +267,8 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
 
   const provider = getProvider(input.model);
 
-  // Append user message first, then fetch history for AI context
-  await conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl);
+  // Append clean user message to DB first, then fetch history for AI context
+  await conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl);
   const history = wantsImage
     ? []
     : await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
@@ -377,7 +280,12 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     imageUrl = await generateImage(input.message);
     replyText = "Here is your generated image.";
   } else {
-    const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
+    const providerMessages: ProviderChatMessage[] = history.map((m, idx) => {
+      if (idx === history.length - 1 && m.role === "user") {
+        return { role: m.role, content: aiPromptMessage };
+      }
+      return { role: m.role, content: m.content };
+    });
     if (imageParts.length > 0) {
       const lastUser = [...providerMessages].reverse().find((m) => m.role === "user");
       if (lastUser) {
@@ -395,15 +303,17 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     $inc: { promptCount: 1 },
   };
 
-  if (needsReset) {
-    updateFields.$set = {
-      promptCount24h: user.subscription === "free" ? (user.promptCount24h ?? 0) : 1,
-      attachmentCount24h: user.subscription === "free" ? 0 : (files ? files.length : 0),
-      lastPromptResetAt: now,
-    };
-  } else if (user.subscription !== "free") {
-    updateFields.$inc.promptCount24h = 1;
-    updateFields.$inc.attachmentCount24h = files ? files.length : 0;
+  if (user.subscription !== "free") {
+    if (needsReset) {
+      updateFields.$set = {
+        promptCount24h: 1,
+        attachmentCount24h: files ? files.length : 0,
+        lastPromptResetAt: now,
+      };
+    } else {
+      updateFields.$inc.promptCount24h = 1;
+      updateFields.$inc.attachmentCount24h = files ? files.length : 0;
+    }
   }
 
   if (wantsImage) {
@@ -489,8 +399,9 @@ export async function* chatStream(
   const promptCount24h = needsReset ? 0 : (user.promptCount24h || 0);
   const attachmentCount24h = needsReset ? 0 : (user.attachmentCount24h || 0);
 
+  const freePromptLimit = limit ?? 3;
   if (user.subscription === "free") {
-    const freePromptLimit = limit ?? 3;
+    // Free plan uses promptCount (all-time lifetime total) — 3 prompts forever, no reset
     if (user.promptCount >= freePromptLimit)
       throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
     if (files && files.length > 0)
@@ -507,7 +418,7 @@ export async function* chatStream(
 
   const tAttachment = new LatencyTimer("Attachment processing");
   const tConversation = new LatencyTimer("Conversation lookup/create");
-  
+
   tAttachment.start();
   const attachmentContextPromise = extractAttachmentContext(files, input.model).then(res => {
     tAttachment.stop();
@@ -528,7 +439,8 @@ export async function* chatStream(
   ]);
 
   const memoryContext = buildMemoryContext(user);
-  const combinedMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
+  const dbUserMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
+  const aiPromptMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
   const imageParts = buildImageContentParts(files);
   const userImageUrl = imageParts[0]?.image_url.url;
   const provider = getProvider(input.model);
@@ -542,7 +454,7 @@ export async function* chatStream(
   tHistory.start();
 
   const [, history] = await Promise.all([
-    conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
+    conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl),
     conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT).then(res => {
       tHistory.stop();
       console.log(`[CHAT] ${tHistory.report()}`);
@@ -553,7 +465,7 @@ export async function* chatStream(
   const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
 
   // Add the current user message (appended in parallel so may not be in history yet)
-  providerMessages.push({ role: "user", content: combinedMessage });
+  providerMessages.push({ role: "user", content: aiPromptMessage });
 
   if (imageParts.length > 0) {
     // The last message is always the current user message we just pushed
@@ -571,22 +483,22 @@ export async function* chatStream(
 
   const providerName = ((input.model || "").split('-')[0] ?? "").toUpperCase();
   console.log(`\n[${providerName}] Request started`);
-  
+
   const tProvider = new LatencyTimer("Provider stream");
   tProvider.start();
-  
+
   const tTTFT = new LatencyTimer("TTFT");
   tTTFT.start();
 
   // Stream tokens to the caller
   let fullReply = "";
   let firstToken = true;
-  
+
   yield { type: "start", conversationId: conversation.id } as unknown as AIStreamChunk;
 
   for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
     if (chunk.type === "start") continue;
-    
+
     if (chunk.type === "token" && firstToken) {
       tTTFT.stop();
       console.log(`[${providerName}] First chunk: ${tTTFT.elapsed()}ms`);
@@ -598,21 +510,23 @@ export async function* chatStream(
     }
     yield chunk;
   }
-  
+
   tProvider.stop();
   console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
 
   // Persist + update counters after streaming completes
   const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
-  if (needsReset) {
-    updateFields.$set = {
-      promptCount24h: user.subscription === "free" ? (user.promptCount24h ?? 0) : 1,
-      attachmentCount24h: user.subscription === "free" ? 0 : (files ? files.length : 0),
-      lastPromptResetAt: now,
-    };
-  } else if (user.subscription !== "free") {
-    updateFields.$inc.promptCount24h = 1;
-    updateFields.$inc.attachmentCount24h = files ? files.length : 0;
+  if (user.subscription !== "free") {
+    if (needsReset) {
+      updateFields.$set = {
+        promptCount24h: 1,
+        attachmentCount24h: files ? files.length : 0,
+        lastPromptResetAt: now,
+      };
+    } else {
+      updateFields.$inc.promptCount24h = 1;
+      updateFields.$inc.attachmentCount24h = files ? files.length : 0;
+    }
   }
 
   const [assistantMessage, updatedUser] = await Promise.all([
@@ -647,7 +561,7 @@ export async function* chatStream(
       promptsLimit: limit,
     },
   };
-  
+
   tTotal.stop();
   console.log(`[CHAT] ${tTotal.report()}\n`);
 }

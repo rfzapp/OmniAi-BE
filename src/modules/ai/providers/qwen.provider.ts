@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { env } from "../../../config/env";
 import type { AIProvider, ProviderChatMessage } from "./provider.types";
-import { toTextContent, handleOpenAICompatError } from "./provider.utils";
+import { toOpenAICompatMessages, handleOpenAICompatError } from "./provider.utils";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
 function getClient(apiKeyOverride?: string): OpenAI {
@@ -11,7 +11,7 @@ function getClient(apiKeyOverride?: string): OpenAI {
 }
 
 function toMessages(messages: ProviderChatMessage[]): ChatCompletionMessageParam[] {
-  return messages.map((m) => ({ role: m.role, content: toTextContent(m.content) })) as ChatCompletionMessageParam[];
+  return toOpenAICompatMessages(messages) as ChatCompletionMessageParam[];
 }
 
 export const qwenProvider: AIProvider = {

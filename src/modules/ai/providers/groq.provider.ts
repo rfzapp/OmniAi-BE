@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { env } from "../../../config/env";
 import type { AIProvider, ProviderChatMessage } from "./provider.types";
-import { toTextContent, handleOpenAICompatError } from "./provider.utils";
+import { toTextContent, toOpenAICompatMessages, handleOpenAICompatError } from "./provider.utils";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
 function getClient(apiKeyOverride?: string): OpenAI {
@@ -18,7 +18,6 @@ function toMessages(messages: ProviderChatMessage[]): ChatCompletionMessageParam
   for (const m of filtered) {
     const last = merged[merged.length - 1];
     if (last && last.role === m.role) {
-      // Merge into previous message
       const prevText = toTextContent(last.content);
       const currText = toTextContent(m.content);
       last.content = `${prevText}\n${currText}`;
@@ -26,7 +25,7 @@ function toMessages(messages: ProviderChatMessage[]): ChatCompletionMessageParam
       merged.push({ ...m });
     }
   }
-  return merged.map((m) => ({ role: m.role, content: toTextContent(m.content) })) as ChatCompletionMessageParam[];
+  return toOpenAICompatMessages(merged) as ChatCompletionMessageParam[];
 }
 
 export const groqProvider: AIProvider = {

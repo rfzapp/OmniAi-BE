@@ -11,13 +11,34 @@ function toAnthropicMessages(messages: ProviderChatMessage[]): Anthropic.Message
   // Also Claude requires alternating user/assistant turns.
   return messages
     .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => ({
-      role: m.role as "user" | "assistant",
-      content: typeof m.content === "string" ? m.content : m.content
-        .filter((p) => p.type === "text")
-        .map((p) => (p as { type: "text"; text: string }).text)
-        .join("\n"),
-    }));
+    .map((m) => {
+      const role = m.role as "user" | "assistant";
+      if (typeof m.content === "string") {
+        return { role, content: m.content };
+      }
+      const blocks: Anthropic.ContentBlockParam[] = m.content.map((part) => {
+        if (part.type === "text") {
+          return { type: "text", text: part.text };
+        }
+        const dataUrl = part.image_url.url;
+        const match = dataUrl.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
+        if (match && match[1] && match[2]) {
+          const rawMime = match[1].toLowerCase();
+          const mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp" =
+            rawMime === "image/jpg" ? "image/jpeg" : (rawMime as any);
+          return {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: mediaType,
+              data: match[2],
+            },
+          };
+        }
+        return { type: "text", text: "" };
+      });
+      return { role, content: blocks };
+    });
 }
 
 export const anthropicProvider: AIProvider = {

@@ -1,22 +1,35 @@
-export interface ModelCapability {
-    supportsVision: boolean;
-}
-
-const MODEL_CAPABILITIES: Record<string, ModelCapability> = {
-    "gpt-5.6-luna": { supportsVision: true },
-    "gpt-5.6-terra": { supportsVision: false },
-    "gpt-5.6-sol": { supportsVision: false },
-    "gpt-omni": { supportsVision: true },
-    "claude-omni": { supportsVision: true },
-    "gemini-omni": { supportsVision: true },
-    "deepseek-omni": { supportsVision: false },
-    "kimi-omni": { supportsVision: false },
-    "grok-omni": { supportsVision: true },
-    "llama-omni": { supportsVision: true },
-    "mistral-omni": { supportsVision: false },
-    "qwen-omni": { supportsVision: true },
-};
+/**
+ * Vision-capable model IDs — these can receive image attachments.
+ * Uses the actual API model strings that reach the providers.
+ */
+const VISION_MODELS = new Set([
+  // OpenAI
+  "gpt-5.6-luna",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  // Anthropic Claude — all current models support vision
+  "claude-haiku-4-5",
+  "claude-haiku-4-5-20251001",
+  "claude-sonnet-5",
+  "claude-opus-5",
+  "claude-fable-5",
+  // Grok (xAI)
+  "grok-4",
+  "grok-3",
+  // DeepSeek — V3 supports vision
+  "deepseek-chat",
+  // Qwen — vision supported
+  "qwen-max",
+  "qwen-plus",
+  "qwen-turbo",
+  // Kimi (Moonshot) — vision supported
+  "kimi-k3",
+  "kimi-k2.6",
+  "moonshot-v1-128k",
+  // Mistral — vision not reliably supported via OpenAI-compatible endpoint
+  // "mistral-large-latest",
+]);
 
 export function supportsVision(modelId: string): boolean {
-    return MODEL_CAPABILITIES[modelId]?.supportsVision ?? false;
+  return VISION_MODELS.has(modelId);
 }
