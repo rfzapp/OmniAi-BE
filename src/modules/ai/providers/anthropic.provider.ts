@@ -7,7 +7,7 @@ const MAX_TOKENS = 4096;
 
 function toAnthropicMessages(messages: ProviderChatMessage[]): Anthropic.MessageParam[] {
   // Claude does not support "system" role in the messages array 
-  // system messages are handled separately as a top-level param.
+  // system messages are handled separately as a top-level param
   // Also Claude requires alternating user/assistant turns.
   return messages
     .filter((m) => m.role === "user" || m.role === "assistant")
