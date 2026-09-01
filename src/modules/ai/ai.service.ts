@@ -418,7 +418,7 @@ export async function* chatStream(
 
   const tAttachment = new LatencyTimer("Attachment processing");
   const tConversation = new LatencyTimer("Conversation lookup/create");
-
+  
   tAttachment.start();
   const attachmentContextPromise = extractAttachmentContext(files, input.model).then(res => {
     tAttachment.stop();
@@ -427,34 +427,44 @@ export async function* chatStream(
   });
 
   tConversation.start();
-  const conversationPromise = conversationService.findOrCreateConversation(userId, input.model, input.message, input.conversationId).then(res => {
+  const conversation = await conversationService.findOrCreateConversation(userId, input.model, input.message, input.conversationId).then(res => {
     tConversation.stop();
     console.log(`[CHAT] ${tConversation.report()}`);
     return res;
   });
 
-  const [attachmentContext, conversation] = await Promise.all([
-    attachmentContextPromise,
-    conversationPromise,
-  ]);
+  // Emit "start" immediately now that we have a conversationId — the frontend
+  // uses this to register the new chat before any tokens arrive.
+  yield { type: "start", conversationId: conversation.id } as unknown as AIStreamChunk;
+
+  // Everything from here on runs inside a try/catch so that any error —
+  // whether from attachment processing, the provider, or mid-stream — is
+  // persisted as the assistant message. This guarantees the exact same error
+  // text shows on page reload as was displayed in the live session.
+  const FALLBACK_ERROR = "Something went wrong. Please try again.";
+  let fullReply = "";
+  let streamError: string | null = null;
+
+  try {
+    // Now wait for attachment processing to finish (may already be done).
+    const attachmentContext = await attachmentContextPromise;
 
   const memoryContext = buildMemoryContext(user);
-  const dbUserMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
-  const aiPromptMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
+  const combinedMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
   const imageParts = buildImageContentParts(files);
   const userImageUrl = imageParts[0]?.image_url.url;
   const provider = getProvider(input.model);
 
-  const tContext = new LatencyTimer("Context construction");
-  tContext.start();
+    const tContext = new LatencyTimer("Context construction");
+    tContext.start();
 
-  // Append user message and fetch history in parallel — history fetch doesn't
-  // need the user message to exist yet since it was just created this turn.
-  const tHistory = new LatencyTimer("History fetch");
-  tHistory.start();
+    // Append user message and fetch history in parallel — history fetch doesn't
+    // need the user message to exist yet since it was just created this turn.
+    const tHistory = new LatencyTimer("History fetch");
+    tHistory.start();
 
   const [, history] = await Promise.all([
-    conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl),
+    conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
     conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT).then(res => {
       tHistory.stop();
       console.log(`[CHAT] ${tHistory.report()}`);
@@ -462,43 +472,43 @@ export async function* chatStream(
     }),
   ]);
 
-  const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
+    const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
 
   // Add the current user message (appended in parallel so may not be in history yet)
-  providerMessages.push({ role: "user", content: aiPromptMessage });
+  providerMessages.push({ role: "user", content: combinedMessage });
 
-  if (imageParts.length > 0) {
-    // The last message is always the current user message we just pushed
-    const lastUser = providerMessages[providerMessages.length - 1];
-    if (lastUser && lastUser.role === "user") {
-      const textContent = String(lastUser.content || "").trim();
-      lastUser.content = textContent
-        ? [{ type: "text", text: textContent }, ...imageParts]
-        : [...imageParts];
+    if (imageParts.length > 0) {
+      // The last message is always the current user message we just pushed
+      const lastUser = providerMessages[providerMessages.length - 1];
+      if (lastUser && lastUser.role === "user") {
+        const textContent = String(lastUser.content || "").trim();
+        lastUser.content = textContent
+          ? [{ type: "text", text: textContent }, ...imageParts]
+          : [...imageParts];
+      }
     }
-  }
 
-  tContext.stop();
-  console.log(`[CHAT] ${tContext.report()}`);
+    tContext.stop();
+    console.log(`[CHAT] ${tContext.report()}`);
 
   const providerName = ((input.model || "").split('-')[0] ?? "").toUpperCase();
   console.log(`\n[${providerName}] Request started`);
-
+  
   const tProvider = new LatencyTimer("Provider stream");
   tProvider.start();
-
+  
   const tTTFT = new LatencyTimer("TTFT");
   tTTFT.start();
 
   // Stream tokens to the caller
   let fullReply = "";
   let firstToken = true;
-
+  
   yield { type: "start", conversationId: conversation.id } as unknown as AIStreamChunk;
 
   for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
     if (chunk.type === "start") continue;
-
+    
     if (chunk.type === "token" && firstToken) {
       tTTFT.stop();
       console.log(`[${providerName}] First chunk: ${tTTFT.elapsed()}ms`);
@@ -510,11 +520,27 @@ export async function* chatStream(
     }
     yield chunk;
   }
-
+  
   tProvider.stop();
   console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
 
-  // Persist + update counters after streaming completes
+  } catch (preStreamErr: any) {
+    // An error occurred before or during setup (attachment processing, DB write,
+    // unsupported model, etc.). Capture so it gets persisted below.
+    if (!streamError) {
+      streamError = preStreamErr instanceof ApiError
+        ? preStreamErr.message
+        : (preStreamErr?.message || FALLBACK_ERROR);
+    }
+  }
+
+  // Persist the actual error message (or successful reply) so it shows
+  // correctly on page reload — same text the user saw in the live session.
+  const contentToSave = fullReply.trim() || (streamError !== null ? (streamError.trim() || FALLBACK_ERROR) : fullReply);
+
+  // Persist + update counters after streaming completes (or fails).
+  // This always runs regardless of streaming outcome so page-reload always
+  // has an assistant message to display.
   const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
   if (user.subscription !== "free") {
     if (needsReset) {
@@ -530,13 +556,27 @@ export async function* chatStream(
   }
 
   const [assistantMessage, updatedUser] = await Promise.all([
-    conversationService.appendMessage(conversation.id as string, "assistant", fullReply, input.model),
+    conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, input.model),
     User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
   ]);
   void conversationService.touchConversation(conversation.id as string);
 
   const promptsUsed = updatedUser?.promptCount ?? user.promptCount + 1;
   const promptsUsed24h = updatedUser?.promptCount24h ?? promptCount24h + 1;
+
+  // If streaming errored, send the SSE error event now (after persisting) so
+  // the client shows a proper error message in the live session while the DB
+  // has the fallback sentinel for page-reload display.
+  if (streamError !== null) {
+    yield {
+      error: true,
+      status: 502,
+      message: streamError,
+    } as unknown as AIStreamChunk;
+    tTotal.stop();
+    console.log(`[CHAT] ${tTotal.report()}\n`);
+    return;
+  }
 
   yield {
     done: true,
