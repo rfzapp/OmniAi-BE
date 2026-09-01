@@ -45,25 +45,41 @@ export async function chatStreamHandler(req: Request, res: Response) {
 
   const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
 
+  // Track whether the client is still connected so we can skip writes on a
+  // closed socket (res.write throws on a destroyed socket).
+  let clientConnected = true;
+
   function sendEvent(data: object) {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-    // Force-flush the response buffer so each token reaches the client immediately.
-    // This matters when compression middleware or Node's internal buffering
-    // would otherwise batch multiple small writes together.
-    if (typeof (res as any).flush === "function") {
-      (res as any).flush();
+    if (!clientConnected) return;
+    try {
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+      // Force-flush the response buffer so each token reaches the client immediately.
+      // This matters when compression middleware or Node's internal buffering
+      // would otherwise batch multiple small writes together.
+      if (typeof (res as any).flush === "function") {
+        (res as any).flush();
+      }
+    } catch {
+      // Socket closed mid-write — mark as disconnected so subsequent writes are skipped.
+      clientConnected = false;
     }
   }
 
+  // The abort signal is passed to the AI provider so it stops generating tokens
+  // when the client disconnects. The generator itself continues to run after the
+  // abort so it can persist whatever content was accumulated before disconnecting.
   const abortController = new AbortController();
   req.on("close", () => {
-    console.log("[CHAT] Client disconnected, request cancelled");
+    console.log("[CHAT] Client disconnected, stopping token generation");
+    clientConnected = false;
     abortController.abort();
   });
 
   try {
     const generator = aiService.chatStream(req.user.id, req.body, files, abortController.signal);
 
+    // Consume the entire generator to ensure the persist step always runs,
+    // even if the client disconnected mid-stream.
     for await (const chunk of generator) {
       sendEvent(chunk);
     }
@@ -75,6 +91,6 @@ export async function chatStreamHandler(req: Request, res: Response) {
       message: apiErr?.message ?? "Something went wrong",
     });
   } finally {
-    res.end();
+    if (!res.writableEnded) res.end();
   }
 }

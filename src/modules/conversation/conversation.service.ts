@@ -123,11 +123,25 @@ export async function getSharedMessages(shareToken: string) {
  * Tries to decrypt — if the content is not in encrypted format (e.g. old
  * plain-text messages that predate encryption), returns the raw value so
  * existing chat history still renders correctly.
+ *
+ * If decryption fails AND the value looks like an AES-GCM payload
+ * (two hex segments separated by colons), it means the message was stored
+ * as encrypted content that can no longer be read (e.g. after a key change,
+ * or a previously-empty message that was mistakenly persisted). In that case
+ * we return a safe fallback rather than leaking the internal payload format.
  */
 function safeDecrypt(content: string): string {
   try {
     return decrypt(content);
   } catch {
+    // AES-256-GCM payloads look like "ivHex:authTagHex:ciphertextHex".
+    // If decryption fails on something matching that pattern, the original
+    // plaintext is unrecoverable — return a neutral fallback instead of the
+    // raw encrypted string.
+    if (/^[0-9a-f]{24}:[0-9a-f]{32}:/i.test(content)) {
+      return "";
+    }
+    // Otherwise it's a legacy plain-text message — return as-is.
     return content;
   }
 }
