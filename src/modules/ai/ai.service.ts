@@ -55,7 +55,7 @@ function isImageRequest(message: string): boolean {
 
 async function extractPdfText(buffer: Buffer): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const pdfParse = require("pdf-parse") as (buffer: Buffer) => Promise<{ text: string }>;
+  const pdfParse = require("pdf-parse") as (buffer: Buffer) => Promise<{ text: string; numpages: number }>;
   const result = await pdfParse(buffer);
   return result.text?.trim() || "";
 }
