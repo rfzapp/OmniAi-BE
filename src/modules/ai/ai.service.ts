@@ -32,9 +32,13 @@ function getProvider(model: string) {
 
 // Keywords that indicate the user wants an image generated.
 const IMAGE_INTENT_PATTERNS = [
-  /\b(generate|create|make|draw|paint|design|show|produce)\b.{0,40}\b(image|picture|photo|illustration|artwork|poster|logo|banner|icon)\b/i,
-  /\b(image|picture|photo|illustration|artwork)\b.{0,20}\b(of|showing|depicting|with)\b/i,
+  /\b(generate|create|make|draw|paint|design|show|produce|render|imagine)\b.{0,50}\b(image|picture|photo|photograph|illustration|artwork|poster|logo|banner|icon|pic)\b/i,
+  /\b(image|picture|photo|photograph|illustration|artwork|render)\b.{0,30}\b(of|showing|depicting|with|for)\b/i,
+  /\b(photograph|photo|picture|illustration|artwork)\b\s+of\b/i,
+  /^prompt:\s*/i,
   /\bdall[-\s]?e\b/i,
+  /\bmidjourney\b/i,
+  /\bstable\s*diffusion\b/i,
 ];
 
 function buildMemoryContext(user: { preferences?: { memoryEnabled?: boolean }; memories?: Array<{ content: string }> }): string {
@@ -169,22 +173,43 @@ function buildImageContentParts(files: Express.Multer.File[] | undefined) {
 
 async function generateImage(prompt: string, apiKeyOverride?: string): Promise<string> {
   const client = getOpenAIClient(apiKeyOverride);
-  const response = await client.images.generate({
-    model: "gpt-image-2",
-    prompt,
-    n: 1,
-    size: "1024x1024",
-  });
+  let response;
+  try {
+    response = await client.images.generate({
+      model: "gpt-image-2",
+      prompt,
+      n: 1,
+      size: "1024x1024",
+      response_format: "b64_json",
+    });
+  } catch (err) {
+    // Fallback if response_format is not accepted by custom model endpoints
+    response = await client.images.generate({
+      model: "gpt-image-2",
+      prompt,
+      n: 1,
+      size: "1024x1024",
+    });
+  }
 
-  // gpt-image-2 returns base64 by default, dall-e returns URLs.
-  // Handle both formats gracefully.
   const item = response.data?.[0];
   if (!item) throw ApiError.internal("Image generation returned no result");
 
-  if (item.url) return item.url;
-
   if (item.b64_json) {
     return `data:image/png;base64,${item.b64_json}`;
+  }
+
+  if (item.url) {
+    try {
+      const imgRes = await fetch(item.url);
+      const arrayBuffer = await imgRes.arrayBuffer();
+      const base64 = Buffer.from(arrayBuffer).toString("base64");
+      const contentType = imgRes.headers.get("content-type") || "image/png";
+      return `data:${contentType};base64,${base64}`;
+    } catch (err) {
+      console.error("[IMAGE] Failed to download and convert image URL to base64, using direct URL:", err);
+      return item.url;
+    }
   }
 
   throw ApiError.internal("Image generation returned no usable data");
@@ -448,6 +473,7 @@ export async function* chatStream(
   // assistant message so reload shows the same text as the live session.
   const FALLBACK_ERROR = "Something went wrong. Please try again.";
   let fullReply = "";
+  let generatedImageUrl: string | undefined;
   let streamError: string | null = null;
 
   try {
@@ -455,7 +481,11 @@ export async function* chatStream(
     const attachmentContext = await attachmentContextPromise;
 
     const memoryContext = buildMemoryContext(user);
-    const combinedMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
+    // dbUserMessage = clean text saved to MongoDB (no memory injected)
+    const dbUserMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
+    // aiPromptMessage = full prompt sent to the AI (includes memory)
+    const aiPromptMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
+
     const imageParts = buildImageContentParts(files);
     const userImageUrl = imageParts[0]?.image_url.url;
     const provider = getProvider(input.model);
@@ -463,78 +493,99 @@ export async function* chatStream(
     const tContext = new LatencyTimer("Context construction");
     tContext.start();
 
-    // Save user message and fetch recent history in parallel.
+    const wantsImage = isImageRequest(input.message);
+
+    if (wantsImage && !canGenerateImages(user.imagePlan)) {
+      throw new ApiError(403, "Image generation requires an Image Generation plan. Please subscribe to unlock it.");
+    }
+
+    if (wantsImage) {
+      const imageLimit = getImageLimit(user.imagePlan);
+      const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
+      const imageCount = now.getTime() - lastImageReset.getTime() >= resetInterval ? 0 : (user.imageCount24h ?? 0);
+      if (imageCount >= imageLimit) {
+        throw new ApiError(403, `Monthly image limit reached for your plan (${imageLimit} images/month). Upgrade your Image Generation plan for more.`);
+      }
+    }
+
+    // Save clean user message to DB, fetch history in parallel
     const tHistory = new LatencyTimer("History fetch");
     tHistory.start();
+
     const [, history] = await Promise.all([
-      conversationService.appendMessage(conversation.id as string, "user", combinedMessage, input.model, userImageUrl),
-      conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT).then((res) => {
+      conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl),
+      (wantsImage ? Promise.resolve([]) : conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT)).then((res) => {
         tHistory.stop();
         console.log(`[CHAT] ${tHistory.report()}`);
         return res;
       }),
     ]);
 
-    // Build provider messages — include the current user turn which may not
-    // be in the history yet (saved in parallel above).
-    const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
-    providerMessages.push({ role: "user", content: combinedMessage });
-
-    if (imageParts.length > 0) {
-      const lastUser = providerMessages[providerMessages.length - 1];
-      if (lastUser && lastUser.role === "user") {
-        const textContent = String(lastUser.content || "").trim();
-        lastUser.content = textContent
-          ? [{ type: "text", text: textContent }, ...imageParts]
-          : [...imageParts];
-      }
-    }
-
     tContext.stop();
     console.log(`[CHAT] ${tContext.report()}`);
 
-    const providerName = ((input.model || "").split("-")[0] ?? "").toUpperCase();
-    console.log(`\n[${providerName}] Request started`);
+    // ── Image generation path ────────────────────────────────────────────────
+    if (wantsImage) {
+      generatedImageUrl = await generateImage(input.message);
+      fullReply = `![Generated Image](${generatedImageUrl})`;
 
-    const tProvider = new LatencyTimer("Provider stream");
-    tProvider.start();
-    const tTTFT = new LatencyTimer("TTFT");
-    tTTFT.start();
-    let firstToken = true;
+      // Yield the image as a markdown img so the frontend renders it immediately
+      yield { type: "token", content: fullReply } as unknown as AIStreamChunk;
+    } else {
 
-    try {
-      for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
-        if (chunk.type === "start") continue;
+      // ── Text streaming path ──────────────────────────────────────────────────
+      const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
 
-        if (chunk.type === "error") {
-          // Provider yielded an error chunk — capture and stop consuming.
-          streamError = (chunk as any).content ?? "AI provider error during streaming";
-          break;
+      // Add the current user message (appended in parallel so may not be in history yet)
+      providerMessages.push({ role: "user", content: aiPromptMessage });
+
+      if (imageParts.length > 0) {
+        const lastUser = providerMessages[providerMessages.length - 1];
+        if (lastUser && lastUser.role === "user") {
+          const textContent = String(lastUser.content || "").trim();
+          lastUser.content = textContent
+            ? [{ type: "text", text: textContent }, ...imageParts]
+            : [...imageParts];
         }
-
-        if (chunk.type === "token" && firstToken) {
-          tTTFT.stop();
-          console.log(`[${providerName}] First chunk: ${tTTFT.elapsed()}ms`);
-          console.log(`[CHAT] TTFT: ${tTotal.elapsed()}ms`);
-          firstToken = false;
-        }
-        if (chunk.type === "token" && chunk.content) {
-          fullReply += chunk.content;
-        }
-        yield chunk;
       }
-    } catch (genErr: any) {
-      // for-await threw directly (e.g. AbortError before provider caught it).
-      if (!streamError) {
-        streamError = genErr?.message || "Stream interrupted";
-      }
-    }
 
-    tProvider.stop();
-    console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
+      const providerName = ((input.model || "").split("-")[0] ?? "").toUpperCase();
+      console.log(`\n[${providerName}] Request started`);
+
+      const tProvider = new LatencyTimer("Provider stream");
+      tProvider.start();
+
+      const tTTFT = new LatencyTimer("TTFT");
+      tTTFT.start();
+
+      let firstToken = true;
+
+      try {
+        for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
+          if (chunk.type === "start") continue;
+
+          if (chunk.type === "token" && firstToken) {
+            tTTFT.stop();
+            console.log(`[${providerName}] First chunk: ${tTTFT.elapsed()}ms`);
+            console.log(`[CHAT] TTFT: ${tTotal.elapsed()}ms`);
+            firstToken = false;
+          }
+          if (chunk.type === "token" && chunk.content) {
+            fullReply += chunk.content;
+          }
+          yield chunk;
+        }
+      } catch (genErr: any) {
+        if (!streamError) {
+          streamError = genErr?.message || "Stream interrupted";
+        }
+      }
+
+      tProvider.stop();
+      console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
+    } // end else (text streaming)
 
   } catch (preStreamErr: any) {
-    // Attachment processing, DB write, unsupported model, etc.
     if (!streamError) {
       streamError = preStreamErr instanceof ApiError
         ? preStreamErr.message
@@ -543,26 +594,24 @@ export async function* chatStream(
   }
 
   // ── 4. Persist assistant message ──────────────────────────────────────────
-  // contentToSave is:
-  //   • fullReply       — the real AI response (success, or partial on abort)
-  //   • streamError     — the exact error text the user saw live  
-  //   • FALLBACK_ERROR  — last resort when error message was empty
-  const contentToSave = fullReply.trim() || (streamError !== null ? (streamError.trim() || FALLBACK_ERROR) : "");
+  const contentToSave = fullReply.trim() || (streamError !== null ? (streamError.trim() || FALLBACK_ERROR) : fullReply);
 
   const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
-  if (needsReset) {
-    updateFields.$set = {
-      promptCount24h: user.subscription === "free" ? (user.promptCount24h ?? 0) : 1,
-      attachmentCount24h: user.subscription === "free" ? 0 : (files ? files.length : 0),
-      lastPromptResetAt: now,
-    };
-  } else if (user.subscription !== "free") {
-    updateFields.$inc.promptCount24h = 1;
-    updateFields.$inc.attachmentCount24h = files ? files.length : 0;
+  if (user.subscription !== "free") {
+    if (needsReset) {
+      updateFields.$set = {
+        promptCount24h: 1,
+        attachmentCount24h: files ? files.length : 0,
+        lastPromptResetAt: now,
+      };
+    } else {
+      updateFields.$inc.promptCount24h = 1;
+      updateFields.$inc.attachmentCount24h = files ? files.length : 0;
+    }
   }
 
   const [assistantMessage, updatedUser] = await Promise.all([
-    conversationService.appendMessage(conversation.id as string, "assistant", contentToSave || FALLBACK_ERROR, input.model),
+    conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, input.model, generatedImageUrl),
     User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
   ]);
   void conversationService.touchConversation(conversation.id as string);
@@ -572,8 +621,6 @@ export async function* chatStream(
 
   // ── 5. Final SSE event ────────────────────────────────────────────────────
   if (streamError !== null) {
-    // Send error event so the live session shows the real error text.
-    // The DB already has the same text for reload.
     yield {
       error: true,
       status: 502,
@@ -598,7 +645,7 @@ export async function* chatStream(
       role: assistantMessage.role,
       content: fullReply,
       model: assistantMessage.model,
-      imageUrl: null,
+      imageUrl: generatedImageUrl ?? null,
       createdAt: assistantMessage.createdAt,
     },
     usage: {

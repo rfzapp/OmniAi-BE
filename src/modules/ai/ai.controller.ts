@@ -75,6 +75,20 @@ export async function chatStreamHandler(req: Request, res: Response) {
     abortController.abort();
   });
 
+  // Start a keep-alive ping every 3 seconds to prevent proxy / HTTP timeouts
+  // during slow tasks (such as image generation or heavy attachments).
+  const keepAliveTimer = setInterval(() => {
+    if (!clientConnected) return;
+    try {
+      res.write(": keep-alive\n\n");
+      if (typeof (res as any).flush === "function") {
+        (res as any).flush();
+      }
+    } catch {
+      clientConnected = false;
+    }
+  }, 3000);
+
   try {
     const generator = aiService.chatStream(req.user.id, req.body, files, abortController.signal);
 
@@ -91,6 +105,7 @@ export async function chatStreamHandler(req: Request, res: Response) {
       message: apiErr?.message ?? "Something went wrong",
     });
   } finally {
+    clearInterval(keepAliveTimer);
     if (!res.writableEnded) res.end();
   }
 }
