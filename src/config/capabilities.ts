@@ -18,10 +18,9 @@ const VISION_MODELS = new Set([
   "grok-3",
   // DeepSeek — V3 supports vision
   "deepseek-chat",
-  // Qwen — vision supported
+  // Qwen — only qwen-max supports vision via DashScope compatible-mode.
+  // qwen-plus and qwen-turbo are text-only; do NOT add them here.
   "qwen-max",
-  "qwen-plus",
-  "qwen-turbo",
   // Kimi (Moonshot) — vision supported
   "kimi-k3",
   "kimi-k2.6",

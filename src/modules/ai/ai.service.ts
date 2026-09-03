@@ -1,6 +1,7 @@
 import { ApiError } from "../../utils/ApiError";
 import { getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit, getPromptCharLimit } from "../../config/plans";
 import { User } from "../user/user.model";
+import { Message } from "../message/message.model";
 import * as conversationService from "../conversation/conversation.service";
 import { openaiProvider } from "./providers/openai.provider";
 import { anthropicProvider } from "./providers/anthropic.provider";
@@ -10,6 +11,10 @@ import { qwenProvider } from "./providers/qwen.provider";
 import { mistralProvider } from "./providers/mistral.provider";
 import { kimiProvider } from "./providers/kimi.provider";
 import { getOpenAIClient } from "../../config/openai";
+import { env } from "../../config/env";
+import OpenAI from "openai";
+import { uploadImageToCloudinary, downloadImageFromCloudinary } from "../../config/cloudinary";
+import { toFile } from "openai/core/uploads";
 import type { AIStreamChunk } from "./providers/provider.types";
 
 import { supportsVision } from "../../config/capabilities";
@@ -30,16 +35,68 @@ function getProvider(model: string) {
   return openaiProvider;
 }
 
-// Keywords that indicate the user wants an image generated.
-const IMAGE_INTENT_PATTERNS = [
-  /\b(generate|create|make|draw|paint|design|show|produce|render|imagine)\b.{0,50}\b(image|picture|photo|photograph|illustration|artwork|poster|logo|banner|icon|pic)\b/i,
-  /\b(image|picture|photo|photograph|illustration|artwork|render)\b.{0,30}\b(of|showing|depicting|with|for)\b/i,
-  /\b(photograph|photo|picture|illustration|artwork)\b\s+of\b/i,
-  /^prompt:\s*/i,
-  /\bdall[-\s]?e\b/i,
-  /\bmidjourney\b/i,
-  /\bstable\s*diffusion\b/i,
-];
+/**
+ * LLM-based intent classifier — replaces fragile regex patterns.
+ *
+ * Sends a single cheap gpt-4o-mini call that reads the user's message plus
+ * whether a prior generated image exists in the conversation, then returns
+ * one of three labels:
+ *
+ *   "new_image"    — generate a brand-new image (no reference image needed).
+ *   "modify_image" — modify/edit the most-recent generated image.
+ *   "chat"         — normal text conversation, no image involved.
+ *
+ * We ask the model to respond with ONLY the label word so parsing is trivial
+ * and there is no risk of exceeding the provider's input limits.
+ *
+ * Falls back to "chat" on any error so the app never crashes.
+ */
+async function classifyImageIntent(
+  message: string,
+  hasPreviousImage: boolean,
+): Promise<"new_image" | "modify_image" | "chat"> {
+const systemPrompt = `You are an intent classifier for an AI assistant that can generate and edit images.
+Given a user message, classify the intent as exactly one of these three labels:
+
+new_image    — the user wants to generate a brand-new image from scratch.
+               Examples: "generate an image of a car", "draw a sunset", "create a logo", "make a picture of Quaid e Azam".
+               CRITICAL: Even if hasPreviousImage is true, if the user explicitly asks to "generate", "create", or "draw" a new image, classify as new_image.
+
+modify_image — the user wants to change, edit, or update a previously generated image.
+               This includes: removing or adding elements, changing background, style, position, color, lighting, subject, cropping, or any visual modification.
+               Examples: "change the suit of this image", "put the plane on the ground", "remove the background", "just the car", "without the flag".
+               ONLY classify as modify_image when the user is explicitly referring to or modifying the existing image. Do NOT use this for brand new requests.
+
+chat         — the user is asking a question or having a normal text conversation.
+               Examples: "what is Pakistan's capital?", "explain RAG".
+
+Respond with ONLY the single label word: new_image, modify_image, or chat. No other text.`;
+
+  const userPrompt = `hasPreviousImage: ${hasPreviousImage}\nUser message: ${message.slice(0, 500)}`;
+
+  try {
+    const client = getOpenAIClient();
+    const res = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userPrompt },
+      ],
+      max_tokens: 10,
+      temperature: 0,
+    });
+    const label = (res.choices[0]?.message?.content ?? "").trim().toLowerCase();
+    if (label === "new_image" || label === "modify_image" || label === "chat") {
+      return label;
+    }
+    // Unexpected output — safe fallback
+    console.warn(`[INTENT] Unexpected classifier label: "${label}", falling back to chat`);
+    return "chat";
+  } catch (err) {
+    console.error("[INTENT] classifyImageIntent failed, falling back to chat:", err);
+    return "chat";
+  }
+}
 
 function buildMemoryContext(user: { preferences?: { memoryEnabled?: boolean }; memories?: Array<{ content: string }> }): string {
   if (user.preferences?.memoryEnabled === false || !Array.isArray(user.memories) || user.memories.length === 0) {
@@ -49,9 +106,7 @@ function buildMemoryContext(user: { preferences?: { memoryEnabled?: boolean }; m
   return `\n\n[User Memory Context]\nOmniAI remembers the following details about the user across conversations:\n${list}\nUse this context to provide personalized and relevant responses naturally.`;
 }
 
-function isImageRequest(message: string): boolean {
-  return IMAGE_INTENT_PATTERNS.some((pattern) => pattern.test(message));
-}
+
 
 async function extractPdfText(buffer: Buffer): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -92,7 +147,21 @@ async function extractAttachmentContext(files: Express.Multer.File[] | undefined
       const lower = name.toLowerCase();
       const mime = file.mimetype || "application/octet-stream";
 
-      if (mime.startsWith("image/")) {
+      // Determine whether this file is an image by MIME type OR by extension.
+      // Browsers (and some multipart parsers) may report "application/octet-stream"
+      // for image files, so extension-based detection is essential here.
+      const isImageMime = mime.startsWith("image/");
+      const isImageExt =
+        lower.endsWith(".png") ||
+        lower.endsWith(".jpg") ||
+        lower.endsWith(".jpeg") ||
+        lower.endsWith(".webp") ||
+        lower.endsWith(".gif");
+      const isImage = isImageMime || isImageExt;
+
+      console.log(`[ATTACHMENT] name=${name} mime=${mime} size=${file.size} isImage=${isImage} model=${model}`);
+
+      if (isImage) {
         if (!supportsVision(model)) {
           throw ApiError.badRequest("This model does not support image attachments. Please select a vision-capable model.");
         }
@@ -139,7 +208,23 @@ async function extractAttachmentContext(files: Express.Multer.File[] | undefined
       ) {
         text = file.buffer.toString("utf-8");
       } else {
-        // Fallback: try reading as UTF-8 string for general files
+        // Fallback: try reading as UTF-8 text for general/unknown files.
+        // Guard: never apply this fallback to image or binary file extensions —
+        // if an image slipped through MIME detection, we must not convert its
+        // raw binary buffer to a string (that produces millions of garbage tokens).
+        const looksLikeBinary =
+          lower.endsWith(".png") ||
+          lower.endsWith(".jpg") ||
+          lower.endsWith(".jpeg") ||
+          lower.endsWith(".webp") ||
+          lower.endsWith(".gif") ||
+          lower.endsWith(".bmp") ||
+          lower.endsWith(".ico") ||
+          lower.endsWith(".tiff") ||
+          lower.endsWith(".heic");
+        if (looksLikeBinary) {
+          return null; // should have been caught by isImage above; skip silently
+        }
         text = file.buffer.toString("utf-8");
       }
 
@@ -153,24 +238,193 @@ async function extractAttachmentContext(files: Express.Multer.File[] | undefined
   return sections.filter(Boolean).join("\n\n");
 }
 
-function buildImageContentParts(files: Express.Multer.File[] | undefined) {
+/**
+ * Upload user-attached image files to Cloudinary and return provider-compatible
+ * image_url content parts using persistent HTTPS URLs.
+ *
+ * Using Cloudinary URLs instead of base64 data URIs:
+ * - Avoids sending megabytes of base64 to text token counters
+ * - Works with providers (like Qwen) that only accept HTTP image URLs
+ * - Keeps the multipart message payload small
+ */
+async function buildImageContentParts(files: Express.Multer.File[] | undefined): Promise<Array<{
+  type: "image_url";
+  image_url: { url: string; detail: "auto" };
+}>> {
   if (!files || files.length === 0) return [];
 
-  return files
-    .filter((file) => (file.mimetype || "").startsWith("image/"))
-    .map((file) => {
-      const base64 = file.buffer.toString("base64");
-      const mime = file.mimetype || "image/png";
+  const imageFiles = files.filter((file) => {
+    const mime = (file.mimetype || "").toLowerCase();
+    const ext = (file.originalname || "").toLowerCase();
+    return (
+      mime.startsWith("image/") ||
+      ext.endsWith(".png") ||
+      ext.endsWith(".jpg") ||
+      ext.endsWith(".jpeg") ||
+      ext.endsWith(".webp") ||
+      ext.endsWith(".gif")
+    );
+  });
+
+  if (imageFiles.length === 0) return [];
+
+  const parts = await Promise.all(
+    imageFiles.map(async (file) => {
+      // Derive a valid MIME type in case the browser sent application/octet-stream
+      let mime = file.mimetype || "";
+      if (!mime.startsWith("image/")) {
+        const ext = (file.originalname || "").toLowerCase();
+        if (ext.endsWith(".png")) mime = "image/png";
+        else if (ext.endsWith(".jpg") || ext.endsWith(".jpeg")) mime = "image/jpeg";
+        else if (ext.endsWith(".webp")) mime = "image/webp";
+        else if (ext.endsWith(".gif")) mime = "image/gif";
+        else mime = "image/png";
+      }
+
+      // Upload to Cloudinary and use the persistent HTTPS URL.
+      // This works with ALL vision providers (OpenAI, Claude, Qwen, Grok, etc.)
+      // because they all accept standard HTTP image URLs.
+      const cloudinaryUrl = await uploadImageToCloudinary(file.buffer, {
+        folder: "omniai/attachments",
+      });
+
+      console.log(`[VISION] Uploaded attachment to Cloudinary: name=${file.originalname} mime=${mime} url=${cloudinaryUrl}`);
+
       return {
         type: "image_url" as const,
         image_url: {
-          url: `data:${mime};base64,${base64}`,
+          url: cloudinaryUrl,
           detail: "auto" as const,
         },
       };
-    });
+    }),
+  );
+
+  return parts;
 }
 
+/**
+ * Looks back through the conversation's persisted messages and returns the
+ * imageUrl of the most recent assistant message that has one.  Returns null
+ * when no prior generated image exists (fresh conversation, or the user has
+ * not asked for an image yet).
+ *
+ * We query the DB directly here instead of reusing an in-memory history slice
+ * so that (a) the result survives page reloads and (b) we only fetch the
+ * single most-recent image message rather than the whole history.
+ */
+async function findPreviousGeneratedImage(conversationId: string): Promise<string | null> {
+  const msg = await Message.findOne(
+    { conversationId, role: "assistant", imageUrl: { $exists: true, $ne: null } },
+    { imageUrl: 1 },
+  ).sort({ createdAt: -1 });
+  return msg?.imageUrl ?? null;
+}
+
+/**
+ * Resolves a stored image reference to a raw Buffer + mime pair for use with
+ * OpenAI's images.edit endpoint.
+ *
+ * Supports two storage formats:
+ *   1. Legacy base64 data URL: "data:<mime>;base64,<data>"
+ *   2. Cloudinary HTTPS URL:   "https://res.cloudinary.com/..."
+ */
+async function resolveImageToBuffer(imageRef: string): Promise<{ buffer: Buffer; mime: string }> {
+  // Cloudinary (or any plain HTTPS) URL
+  if (imageRef.startsWith("https://") || imageRef.startsWith("http://")) {
+    const buffer = await downloadImageFromCloudinary(imageRef);
+    // Derive MIME from URL extension; default to png
+    const lower = imageRef.toLowerCase().split("?")[0] ?? "";
+    let mime = "image/png";
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) mime = "image/jpeg";
+    else if (lower.endsWith(".webp")) mime = "image/webp";
+    else if (lower.endsWith(".gif")) mime = "image/gif";
+    return { buffer, mime };
+  }
+
+  // Legacy base64 data URL
+  const match = imageRef.match(/^data:([^;]+);base64,(.+)$/s);
+  if (!match) throw new Error("Previous image is not in a supported format (expected HTTPS URL or data URI)");
+  return { buffer: Buffer.from(match[2]!, "base64"), mime: match[1]! };
+}
+
+/**
+ * Edit (image-to-image) generation using OpenAI's images.edit endpoint.
+ *
+ * Accepts either a Cloudinary HTTPS URL or a legacy base64 data URL as the
+ * reference image. The result is uploaded to Cloudinary and a persistent
+ * HTTPS URL is returned — no base64 is stored in MongoDB.
+ *
+ * Image generation always uses gpt-image-2. The user's selected model is only
+ * used for chat/text responses, not for pixel generation.
+ */
+async function editImage(previousImageRef: string, prompt: string, apiKeyOverride?: string): Promise<string> {
+  const t0 = Date.now();
+  console.log(`[IMAGE_EDIT] editImage START — imageRef="${previousImageRef.slice(0, 80)}" len=${previousImageRef.length}`);
+
+  const client = getOpenAIClient(apiKeyOverride);
+
+  // ── Step 1: resolve reference → Buffer ───────────────────────────────────
+  const t1 = Date.now();
+  const { buffer, mime } = await resolveImageToBuffer(previousImageRef);
+  console.log(`[IMAGE_EDIT] resolve image: ${Date.now() - t1}ms — mime=${mime} bufferBytes=${buffer.length}`);
+
+  // ── Step 2: wrap Buffer as Uploadable File ────────────────────────────────
+  const t2 = Date.now();
+  const imageFile = await toFile(buffer, "reference.png", { type: mime });
+  console.log(`[IMAGE_EDIT] toFile: ${Date.now() - t2}ms`);
+
+  // ── Step 3: OpenAI images.edit API call ──────────────────────────────────
+  const t3 = Date.now();
+  console.log(`[IMAGE_EDIT] provider API request START — model=gpt-image-2 prompt="${prompt.slice(0, 80)}"`);
+
+  let response;
+  try {
+    response = await client.images.edit({
+      model: "gpt-image-2",
+      image: imageFile,
+      prompt,
+      n: 1,
+      size: "1024x1024",
+    });
+  } catch (err: any) {
+    throw ApiError.badRequest(`Image editing failed: ${err.message || "Unknown provider error"}`);
+  }
+
+  console.log(`[IMAGE_EDIT] provider API response RECEIVED: ${Date.now() - t3}ms`);
+
+  const item = response.data?.[0];
+  if (!item) throw ApiError.internal("Image edit returned no result");
+
+  // ── Step 4: get raw image bytes from the response ─────────────────────────
+  const t4 = Date.now();
+  let rawBuffer: Buffer;
+
+  if (item.b64_json) {
+    rawBuffer = Buffer.from(item.b64_json, "base64");
+    console.log(`[IMAGE_EDIT] got b64_json: ${Date.now() - t4}ms`);
+  } else if (item.url) {
+    console.log(`[IMAGE_EDIT] downloading from OpenAI URL`);
+    const imgRes = await fetch(item.url);
+    rawBuffer = Buffer.from(await imgRes.arrayBuffer());
+    console.log(`[IMAGE_EDIT] OpenAI URL download: ${Date.now() - t4}ms`);
+  } else {
+    throw ApiError.internal("Image edit returned no usable data");
+  }
+
+  // ── Step 5: upload to Cloudinary ─────────────────────────────────────────
+  const t5 = Date.now();
+  const cloudinaryUrl = await uploadImageToCloudinary(rawBuffer, { folder: "omniai/generated" });
+  console.log(`[IMAGE_EDIT] Cloudinary upload: ${Date.now() - t5}ms — url=${cloudinaryUrl}`);
+  console.log(`[IMAGE_EDIT] COMPLETE: total=${Date.now() - t0}ms`);
+
+  return cloudinaryUrl;
+}
+
+/**
+ * Generate a new image using gpt-image-2.
+ * Image generation always uses gpt-image-2 regardless of selected chat model.
+ */
 async function generateImage(prompt: string, apiKeyOverride?: string): Promise<string> {
   const client = getOpenAIClient(apiKeyOverride);
   let response;
@@ -182,37 +436,42 @@ async function generateImage(prompt: string, apiKeyOverride?: string): Promise<s
       size: "1024x1024",
       response_format: "b64_json",
     });
-  } catch (err) {
-    // Fallback if response_format is not accepted by custom model endpoints
-    response = await client.images.generate({
-      model: "gpt-image-2",
-      prompt,
-      n: 1,
-      size: "1024x1024",
-    });
+  } catch (err: any) {
+    // Fallback without response_format
+    try {
+      response = await client.images.generate({
+        model: "gpt-image-2",
+        prompt,
+        n: 1,
+        size: "1024x1024",
+      });
+    } catch (err2: any) {
+      throw ApiError.badRequest(`Image generation failed: ${err2.message || "Unknown provider error"}`);
+    }
   }
 
   const item = response.data?.[0];
   if (!item) throw ApiError.internal("Image generation returned no result");
 
-  if (item.b64_json) {
-    return `data:image/png;base64,${item.b64_json}`;
-  }
+  let rawBuffer: Buffer;
 
-  if (item.url) {
+  if (item.b64_json) {
+    rawBuffer = Buffer.from(item.b64_json, "base64");
+  } else if (item.url) {
     try {
       const imgRes = await fetch(item.url);
-      const arrayBuffer = await imgRes.arrayBuffer();
-      const base64 = Buffer.from(arrayBuffer).toString("base64");
-      const contentType = imgRes.headers.get("content-type") || "image/png";
-      return `data:${contentType};base64,${base64}`;
+      rawBuffer = Buffer.from(await imgRes.arrayBuffer());
     } catch (err) {
-      console.error("[IMAGE] Failed to download and convert image URL to base64, using direct URL:", err);
+      console.error("[IMAGE] Failed to download image from OpenAI URL:", err);
       return item.url;
     }
+  } else {
+    throw ApiError.internal("Image generation returned no usable data");
   }
 
-  throw ApiError.internal("Image generation returned no usable data");
+  // Upload to Cloudinary and return a persistent HTTPS URL
+  const cloudinaryUrl = await uploadImageToCloudinary(rawBuffer, { folder: "omniai/generated" });
+  return cloudinaryUrl;
 }
 
 export async function chat(userId: string, input: ChatInput, files?: Express.Multer.File[]) {
@@ -270,13 +529,40 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const dbUserMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
   const aiPromptMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
 
-  const wantsImage = isImageRequest(input.message);
+  const imageParts = await buildImageContentParts(files);
+  const hasAttachedImages = imageParts.length > 0;
 
-  if (wantsImage && !canGenerateImages(user.imagePlan)) {
+  // ── Intent classification ────────────────────────────────────────────────
+  // If the user attached an image file, this is always a vision/understanding
+  // request — never image generation. Skip the classifier in that case.
+  let wantsImage = false;
+  let wantsModification = false;
+
+  if (!hasAttachedImages) {
+    const hasPrevImage = input.conversationId
+      ? (await findPreviousGeneratedImage(input.conversationId)) !== null
+      : false;
+    const intent = await classifyImageIntent(input.message, hasPrevImage);
+    console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
+    wantsImage = intent === "new_image";
+    wantsModification = intent === "modify_image";
+  } else {
+    console.log(`[INTENT] attached image file — routing to vision/chat path`);
+  }
+
+  // Only look up the previous image URL when we actually need it.
+  const previousImageUrl = wantsModification && input.conversationId
+    ? await findPreviousGeneratedImage(input.conversationId)
+    : null;
+
+  const isModification = wantsModification && previousImageUrl !== null;
+  const isImageOp = wantsImage || isModification;
+
+  if (isImageOp && !canGenerateImages(user.imagePlan)) {
     throw new ApiError(403, "Image generation requires an Image Generation plan. Please subscribe to unlock it.");
   }
 
-  if (wantsImage) {
+  if (isImageOp) {
     const imageLimit = getImageLimit(user.imagePlan);
     const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
     const imageCount = (now.getTime() - lastImageReset.getTime() >= resetInterval)
@@ -287,21 +573,24 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     }
   }
 
-  const imageParts = buildImageContentParts(files);
   const userImageUrl = imageParts[0]?.image_url.url;
 
   const provider = getProvider(input.model);
 
   // Append clean user message to DB first, then fetch history for AI context
   await conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl);
-  const history = wantsImage
+  const history = isImageOp
     ? []
     : await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
 
   let replyText: string;
   let imageUrl: string | undefined;
 
-  if (wantsImage) {
+  if (isModification && previousImageUrl) {
+    // Image-to-image edit: pass the previous image + the user's instruction
+    imageUrl = await editImage(previousImageUrl, input.message);
+    replyText = "Here is your modified image.";
+  } else if (wantsImage) {
     imageUrl = await generateImage(input.message);
     replyText = "Here is your generated image.";
   } else {
@@ -341,7 +630,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     }
   }
 
-  if (wantsImage) {
+  if (isImageOp) {
     const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
     const imageIsReset = now.getTime() - lastImageReset.getTime() >= resetInterval;
     if (imageIsReset) {
@@ -475,6 +764,8 @@ export async function* chatStream(
   let fullReply = "";
   let generatedImageUrl: string | undefined;
   let streamError: string | null = null;
+  // Hoisted outside try so the image-counter update block can see it after the stream ends.
+  let didImageOp = false;
 
   try {
     // Wait for attachment extraction (may already be done).
@@ -486,20 +777,61 @@ export async function* chatStream(
     // aiPromptMessage = full prompt sent to the AI (includes memory)
     const aiPromptMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
 
-    const imageParts = buildImageContentParts(files);
+    const imageParts = await buildImageContentParts(files);
     const userImageUrl = imageParts[0]?.image_url.url;
     const provider = getProvider(input.model);
+
+    console.log(`[CHAT] model=${input.model} imageParts=${imageParts.length} hasFiles=${(files?.length ?? 0) > 0}`);
 
     const tContext = new LatencyTimer("Context construction");
     tContext.start();
 
-    const wantsImage = isImageRequest(input.message);
+    // ── Intent classification (LLM-based) ────────────────────────────────────
+    // IMPORTANT: If the user attached an image file, this is always an image
+    // understanding/vision request — never an image generation request.
+    // Skip the classifier entirely and go straight to the chat/vision path.
+    const hasAttachedImages = imageParts.length > 0;
 
-    if (wantsImage && !canGenerateImages(user.imagePlan)) {
+    let wantsImage = false;
+    let wantsModification = false;
+
+    if (!hasAttachedImages) {
+      // Only run the LLM classifier when no image file is attached.
+      const tHasPrev = Date.now();
+      const hasPrevImage = input.conversationId
+        ? (await findPreviousGeneratedImage(input.conversationId)) !== null
+        : false;
+      console.log(`[IMAGE_EDIT] findPreviousGeneratedImage (hasPrev check): ${Date.now() - tHasPrev}ms — hasPrevImage=${hasPrevImage}`);
+
+      const tClassify = Date.now();
+      const intent = await classifyImageIntent(input.message, hasPrevImage);
+      console.log(`[IMAGE_EDIT] classifyImageIntent: ${Date.now() - tClassify}ms`);
+      console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
+
+      wantsImage = intent === "new_image";
+      wantsModification = intent === "modify_image";
+    } else {
+      console.log(`[INTENT] attached image file detected — routing to vision/chat path`);
+    }
+
+    // Only fetch the actual image URL when we need it for editing.
+    const tPrevUrl = Date.now();
+    const previousImageUrl = wantsModification && input.conversationId
+      ? await findPreviousGeneratedImage(input.conversationId)
+      : null;
+    if (wantsModification) {
+      console.log(`[IMAGE_EDIT] findPreviousGeneratedImage (URL fetch): ${Date.now() - tPrevUrl}ms — found=${previousImageUrl !== null} urlLen=${previousImageUrl?.length ?? 0}`);
+    }
+
+    const isModification = wantsModification && previousImageUrl !== null;
+    const isImageOp = wantsImage || isModification;
+    if (isImageOp) didImageOp = true;
+
+    if (isImageOp && !canGenerateImages(user.imagePlan)) {
       throw new ApiError(403, "Image generation requires an Image Generation plan. Please subscribe to unlock it.");
     }
 
-    if (wantsImage) {
+    if (isImageOp) {
       const imageLimit = getImageLimit(user.imagePlan);
       const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
       const imageCount = now.getTime() - lastImageReset.getTime() >= resetInterval ? 0 : (user.imageCount24h ?? 0);
@@ -514,7 +846,7 @@ export async function* chatStream(
 
     const [, history] = await Promise.all([
       conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl),
-      (wantsImage ? Promise.resolve([]) : conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT)).then((res) => {
+      (isImageOp ? Promise.resolve([]) : conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT)).then((res) => {
         tHistory.stop();
         console.log(`[CHAT] ${tHistory.report()}`);
         return res;
@@ -524,17 +856,53 @@ export async function* chatStream(
     tContext.stop();
     console.log(`[CHAT] ${tContext.report()}`);
 
-    // ── Image generation path ────────────────────────────────────────────────
-    if (wantsImage) {
-      generatedImageUrl = await generateImage(input.message);
-      fullReply = `![Generated Image](${generatedImageUrl})`;
+    // ── Image modification path ──────────────────────────────────────────────
+    if (isModification && previousImageUrl) {
+      const tEditStart = Date.now();
+      console.log(`[IMAGE_EDIT] modify_image BRANCH START — prevImageUrlLen=${previousImageUrl.length}`);
 
-      // Yield the image as a markdown img so the frontend renders it immediately
+      generatedImageUrl = await editImage(previousImageUrl, input.message);
+
+      console.log(`[IMAGE_EDIT] editImage RETURNED — took=${Date.now() - tEditStart}ms resultLen=${generatedImageUrl.length}`);
+
+      // fullReply is the text saved to DB and sent as message content.
+      // The actual image is delivered via generatedImageUrl → done event → imageUrl field.
+      // Do NOT yield a markdown image token here — the frontend renders imageUrl
+      // as a standalone <img> tag, so yielding markdown would produce two images.
+      fullReply = "Here is your modified image.";
+      yield { type: "token", content: fullReply } as unknown as AIStreamChunk;
+
+    // ── Image generation path ────────────────────────────────────────────────
+    } else if (wantsImage) {
+      generatedImageUrl = await generateImage(input.message);
+      // fullReply is the text label stored in DB and sent as message content.
+      // The image itself is delivered through generatedImageUrl → done event → imageUrl.
+      // Do NOT yield a markdown image token — that would render a second image
+      // alongside the one the frontend already shows from the imageUrl field.
+      fullReply = "Here is your generated image.";
       yield { type: "token", content: fullReply } as unknown as AIStreamChunk;
     } else {
 
       // ── Text streaming path ──────────────────────────────────────────────────
-      const providerMessages: ProviderChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
+      // Filter out any messages with empty content — these are failed responses
+      // that were persisted as empty strings. Sending them to providers like Qwen
+      // causes "Range of input length should be [1, 1000000]" errors since they
+      // reject zero-length message content.
+      //
+      // Also strip messages whose content is a base64 data URL (e.g. a previously
+      // generated image stored as "![Generated Image](data:image/png;base64,...)").
+      // Those strings are megabytes long and will exceed provider input limits.
+      const providerMessages: ProviderChatMessage[] = history
+        .filter((m) => {
+          if (typeof m.content !== "string") return true;
+          const text = m.content.trim();
+          if (text.length === 0) return false;
+          // Drop messages that are (or embed) base64 data URLs — they are far too
+          // large for text model context windows.
+          if (text.includes("data:image/") && text.includes(";base64,")) return false;
+          return true;
+        })
+        .map((m) => ({ role: m.role, content: m.content }));
 
       // Add the current user message (appended in parallel so may not be in history yet)
       providerMessages.push({ role: "user", content: aiPromptMessage });
@@ -564,6 +932,14 @@ export async function* chatStream(
         for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
           if (chunk.type === "start") continue;
 
+          // Provider signalled a stream-level error — capture it, yield it so
+          // the frontend shows the message immediately, then stop consuming.
+          if ((chunk as any).type === "error") {
+            streamError = (chunk as any).content ?? "AI provider error during streaming";
+            yield chunk;
+            break;
+          }
+
           if (chunk.type === "token" && firstToken) {
             tTTFT.stop();
             console.log(`[${providerName}] First chunk: ${tTTFT.elapsed()}ms`);
@@ -583,7 +959,7 @@ export async function* chatStream(
 
       tProvider.stop();
       console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
-    } // end else (text streaming)
+    } // end else (text streaming path)
 
   } catch (preStreamErr: any) {
     if (!streamError) {
@@ -594,7 +970,12 @@ export async function* chatStream(
   }
 
   // ── 4. Persist assistant message ──────────────────────────────────────────
-  const contentToSave = fullReply.trim() || (streamError !== null ? (streamError.trim() || FALLBACK_ERROR) : fullReply);
+  // When a stream error occurs we intentionally save the FALLBACK_ERROR string
+  // rather than the raw provider error message. Storing provider errors (e.g.
+  // "400 InternalError.Algo.InvalidParameter: Range of input length...") would
+  // re-inject them into conversation history on the next turn, potentially
+  // triggering the same failure again on providers like Qwen.
+  const contentToSave = fullReply.trim() || (streamError !== null ? FALLBACK_ERROR : fullReply);
 
   const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
   if (user.subscription !== "free") {
@@ -610,11 +991,26 @@ export async function* chatStream(
     }
   }
 
+  // Count image generations (new images and edits both consume from the image quota).
+  if (didImageOp) {
+    const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
+    const imageIsReset = now.getTime() - lastImageReset.getTime() >= resetInterval;
+    if (imageIsReset) {
+      updateFields.$set = { ...(updateFields.$set ?? {}), imageCount24h: 1, lastImageResetAt: now };
+    } else {
+      updateFields.$inc.imageCount24h = 1;
+    }
+  }
+
+  const tPersist = Date.now();
+
   const [assistantMessage, updatedUser] = await Promise.all([
     conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, input.model, generatedImageUrl),
     User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
   ]);
   void conversationService.touchConversation(conversation.id as string);
+
+  console.log(`[IMAGE_EDIT] DB persist (appendMessage + user update): ${Date.now() - tPersist}ms`);
 
   const promptsUsed = updatedUser?.promptCount ?? user.promptCount + 1;
   const promptsUsed24h = updatedUser?.promptCount24h ?? promptCount24h + 1;
