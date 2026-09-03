@@ -29,7 +29,7 @@ function getProvider(model: string) {
   if (model.startsWith("claude-")) return anthropicProvider;
   if (model.startsWith("grok-")) return groqProvider;
   if (model.startsWith("deepseek-")) return deepseekProvider;
-  if (model.startsWith("qwen-")) return qwenProvider;
+  if (model.startsWith("qwen-") || model.startsWith("qwen3")) return qwenProvider;
   if (model.startsWith("mistral-") || model.startsWith("codestral-")) return mistralProvider;
   if (model.startsWith("moonshot-") || model.startsWith("kimi-")) return kimiProvider;
   return openaiProvider;
@@ -54,23 +54,23 @@ function getProvider(model: string) {
 async function classifyImageIntent(
   message: string,
   hasPreviousImage: boolean,
-): Promise<"new_image" | "modify_image" | "chat"> {
+): Promise<"NEW_IMAGE" | "IMAGE_MODIFICATION" | "NORMAL_CHAT"> {
 const systemPrompt = `You are an intent classifier for an AI assistant that can generate and edit images.
 Given a user message, classify the intent as exactly one of these three labels:
 
-new_image    — the user wants to generate a brand-new image from scratch.
+NEW_IMAGE    — the user wants to generate a brand-new image from scratch.
                Examples: "generate an image of a car", "draw a sunset", "create a logo", "make a picture of Quaid e Azam".
-               CRITICAL: Even if hasPreviousImage is true, if the user explicitly asks to "generate", "create", or "draw" a new image, classify as new_image.
+               CRITICAL: Even if hasPreviousImage is true, if the user explicitly asks to "generate", "create", or "draw" a new image, classify as NEW_IMAGE. DO NOT classify as IMAGE_MODIFICATION just because a previous image exists.
 
-modify_image — the user wants to change, edit, or update a previously generated image.
+IMAGE_MODIFICATION — the user wants to change, edit, or update a previously generated image.
                This includes: removing or adding elements, changing background, style, position, color, lighting, subject, cropping, or any visual modification.
                Examples: "change the suit of this image", "put the plane on the ground", "remove the background", "just the car", "without the flag".
-               ONLY classify as modify_image when the user is explicitly referring to or modifying the existing image. Do NOT use this for brand new requests.
+               ONLY classify as IMAGE_MODIFICATION when the user is explicitly referring to or modifying the existing image. Do NOT use this for brand new requests.
 
-chat         — the user is asking a question or having a normal text conversation.
+NORMAL_CHAT  — the user is asking a question or having a normal text conversation.
                Examples: "what is Pakistan's capital?", "explain RAG".
 
-Respond with ONLY the single label word: new_image, modify_image, or chat. No other text.`;
+Respond with ONLY the single label word: NEW_IMAGE, IMAGE_MODIFICATION, or NORMAL_CHAT. No other text.`;
 
   const userPrompt = `hasPreviousImage: ${hasPreviousImage}\nUser message: ${message.slice(0, 500)}`;
 
@@ -85,16 +85,16 @@ Respond with ONLY the single label word: new_image, modify_image, or chat. No ot
       max_tokens: 10,
       temperature: 0,
     });
-    const label = (res.choices[0]?.message?.content ?? "").trim().toLowerCase();
-    if (label === "new_image" || label === "modify_image" || label === "chat") {
-      return label;
+    const label = (res.choices[0]?.message?.content ?? "").trim().toUpperCase();
+    if (label === "NEW_IMAGE" || label === "IMAGE_MODIFICATION" || label === "NORMAL_CHAT") {
+      return label as "NEW_IMAGE" | "IMAGE_MODIFICATION" | "NORMAL_CHAT";
     }
     // Unexpected output — safe fallback
-    console.warn(`[INTENT] Unexpected classifier label: "${label}", falling back to chat`);
-    return "chat";
+    console.warn(`[INTENT] Unexpected classifier label: "${label}", falling back to NORMAL_CHAT`);
+    return "NORMAL_CHAT";
   } catch (err) {
-    console.error("[INTENT] classifyImageIntent failed, falling back to chat:", err);
-    return "chat";
+    console.error("[INTENT] classifyImageIntent failed, falling back to NORMAL_CHAT:", err);
+    return "NORMAL_CHAT";
   }
 }
 
@@ -535,20 +535,21 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   // ── Intent classification ────────────────────────────────────────────────
   // If the user attached an image file, this is always a vision/understanding
   // request — never image generation. Skip the classifier in that case.
-  let wantsImage = false;
-  let wantsModification = false;
+  let intent = "NORMAL_CHAT";
 
   if (!hasAttachedImages) {
     const hasPrevImage = input.conversationId
       ? (await findPreviousGeneratedImage(input.conversationId)) !== null
       : false;
-    const intent = await classifyImageIntent(input.message, hasPrevImage);
-    console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
-    wantsImage = intent === "new_image";
-    wantsModification = intent === "modify_image";
+    intent = await classifyImageIntent(input.message, hasPrevImage);
   } else {
-    console.log(`[INTENT] attached image file — routing to vision/chat path`);
+    intent = "IMAGE_ANALYSIS";
   }
+  
+  console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
+
+  const wantsImage = intent === "NEW_IMAGE";
+  const wantsModification = intent === "IMAGE_MODIFICATION";
 
   // Only look up the previous image URL when we actually need it.
   const previousImageUrl = wantsModification && input.conversationId
@@ -744,6 +745,9 @@ export async function* chatStream(
     console.log(`[CHAT] ${tAttachment.report()}`);
     return res;
   });
+  // Attach a noop rejection handler so Node does not log
+  // PromiseRejectionHandledWarning when the error is caught later via `await`.
+  attachmentContextPromise.catch(() => {});
 
   tConversation.start();
   const conversation = await conversationService
@@ -792,8 +796,7 @@ export async function* chatStream(
     // Skip the classifier entirely and go straight to the chat/vision path.
     const hasAttachedImages = imageParts.length > 0;
 
-    let wantsImage = false;
-    let wantsModification = false;
+    let intent = "NORMAL_CHAT";
 
     if (!hasAttachedImages) {
       // Only run the LLM classifier when no image file is attached.
@@ -804,15 +807,16 @@ export async function* chatStream(
       console.log(`[IMAGE_EDIT] findPreviousGeneratedImage (hasPrev check): ${Date.now() - tHasPrev}ms — hasPrevImage=${hasPrevImage}`);
 
       const tClassify = Date.now();
-      const intent = await classifyImageIntent(input.message, hasPrevImage);
+      intent = await classifyImageIntent(input.message, hasPrevImage);
       console.log(`[IMAGE_EDIT] classifyImageIntent: ${Date.now() - tClassify}ms`);
-      console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
-
-      wantsImage = intent === "new_image";
-      wantsModification = intent === "modify_image";
     } else {
-      console.log(`[INTENT] attached image file detected — routing to vision/chat path`);
+      intent = "IMAGE_ANALYSIS";
     }
+    
+    console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
+
+    let wantsImage = intent === "NEW_IMAGE";
+    let wantsModification = intent === "IMAGE_MODIFICATION";
 
     // Only fetch the actual image URL when we need it for editing.
     const tPrevUrl = Date.now();

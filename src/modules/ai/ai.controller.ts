@@ -65,15 +65,34 @@ export async function chatStreamHandler(req: Request, res: Response) {
     }
   }
 
-  // The abort signal is passed to the AI provider so it stops generating tokens
-  // when the client disconnects. The generator itself continues to run after the
-  // abort so it can persist whatever content was accumulated before disconnecting.
+  // AbortController for cancelling the AI provider stream.
+  //
+  // IMPORTANT: We do NOT abort on req "close" or res "close" events.
+  //
+  // On multipart/form-data requests (file uploads), Node.js fires both the
+  // req "close" and res "close" events when the browser transitions from
+  // "sending the request body" to "receiving the streaming response" — i.e.
+  // right after flushHeaders(). Listening to either of these would abort the
+  // signal before the Cloudinary upload or AI API call even starts, silently
+  // killing every image request.
+  //
+  // The ONLY reliable signal for a genuine client disconnect is the underlying
+  // TCP socket's "close" event, which only fires when the socket is actually
+  // destroyed (browser navigated away, tab closed, network dropped).
   const abortController = new AbortController();
-  req.on("close", () => {
-    console.log("[CHAT] Client disconnected, stopping token generation");
-    clientConnected = false;
-    abortController.abort();
-  });
+
+  // Use the response socket's "close" event, which fires only when the TCP
+  // connection is truly torn down — not during the multipart body → SSE transition.
+  const socket = (res as any).socket ?? (res as any).req?.socket;
+  if (socket) {
+    socket.once("close", () => {
+      if (clientConnected) {
+        console.log("[CHAT] Client disconnected (socket closed), stopping token generation");
+        clientConnected = false;
+        abortController.abort();
+      }
+    });
+  }
 
   // Start a keep-alive ping every 3 seconds to prevent proxy / HTTP timeouts
   // during slow tasks (such as image generation or heavy attachments).
