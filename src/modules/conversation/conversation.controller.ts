@@ -5,14 +5,18 @@ import * as conversationService from "./conversation.service";
 
 export async function listConversationsHandler(req: Request, res: Response) {
   if (!req.user) throw ApiError.unauthorized();
-  const conversations = await conversationService.listConversations(req.user.id);
+  const limit = req.query['limit'] ? Math.min(Math.max(parseInt(req.query['limit'] as string, 10) || 50, 1), 200) : 50;
+  const skip = req.query['skip'] ? Math.max(parseInt(req.query['skip'] as string, 10) || 0, 0) : 0;
+  const conversations = await conversationService.listConversations(req.user.id, limit, skip);
   sendSuccess(res, 200, "Conversations fetched successfully", { conversations });
 }
 
 export async function listMessagesHandler(req: Request, res: Response) {
   if (!req.user) throw ApiError.unauthorized();
   const conversationId = req.params["id"] as string;
-  const messages = await conversationService.listMessages(req.user.id, conversationId);
+  const limit = req.query['limit'] ? Math.min(Math.max(parseInt(req.query['limit'] as string, 10) || 100, 1), 500) : 100;
+  const before = req.query['before'] as string | undefined;
+  const messages = await conversationService.listMessages(req.user.id, conversationId, limit, before);
   sendSuccess(res, 200, "Messages fetched successfully", { messages });
 }
 

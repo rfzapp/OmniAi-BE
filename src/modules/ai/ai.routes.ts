@@ -2,8 +2,8 @@ import { Router } from "express";
 import multer from "multer";
 import { authMiddleware } from "../../middlewares/auth.middleware";
 import { validate } from "../../middlewares/validate.middleware";
-import { chatSchema } from "./ai.validation";
-import { chatHandler, chatStreamHandler } from "./ai.controller";
+import { chatSchema, editImageSchema } from "./ai.validation";
+import { chatHandler, chatStreamHandler, editImageHandler } from "./ai.controller";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -45,10 +45,34 @@ const upload = multer({
   },
 });
 
+const editUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+    files: 2,
+  },
+  fileFilter: (_req, file, cb) => {
+    if (["image/png", "image/jpeg", "image/webp"].includes(file.mimetype) || file.originalname.match(/\.(png|jpg|jpeg|webp)$/i)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported image type: ${file.mimetype || file.originalname}`));
+    }
+  },
+});
+
 const router = Router();
 
 router.use(authMiddleware);
 router.post("/chat", upload.array("attachments", 1), validate({ body: chatSchema }), chatHandler);
 router.post("/chat/stream", upload.array("attachments", 1), validate({ body: chatSchema }), chatStreamHandler);
+router.post(
+  "/edit-image",
+  editUpload.fields([
+    { name: "image", maxCount: 1 },
+    { name: "mask", maxCount: 1 },
+  ]),
+  validate({ body: editImageSchema }),
+  editImageHandler
+);
 
 export default router;

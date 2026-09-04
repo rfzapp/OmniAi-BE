@@ -3,6 +3,7 @@ import {
   getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit, getPromptCharLimit,
   isModelAccessible, getRequiredPlanForModel, capitalizePlan, normalizePlan,
 } from "../../config/plans";
+import { getPromptLimit, getAttachmentLimit, getPromptCharLimit, canGenerateImages, getImageLimit } from "../../config/plans";
 import { User } from "../user/user.model";
 import { Message } from "../message/message.model";
 import * as conversationService from "../conversation/conversation.service";
@@ -26,6 +27,118 @@ import type { ProviderChatMessage } from "./providers/provider.types";
 import { LatencyTimer } from "../../utils/latencyTimer";
 
 const HISTORY_LIMIT = 20;
+const OPENAI_IMAGE_MODEL = "gpt-image-2";
+const QWEN_IMAGE_MODELS = {
+  low: "qwen-image-plus",
+  medium: "qwen-image-plus",
+  high: "qwen-image-plus",
+} as const;
+const WAN_IMAGE_MODELS = {
+  low: "wan2.7-image",
+  medium: "wan2.7-image",
+  high: "wan2.7-image-pro",
+} as const;
+const QWEN_IMAGE_POLL_INTERVAL_MS = 2_000;
+const QWEN_IMAGE_MAX_POLLS = 90;
+
+type ImageQuality = "low" | "medium" | "high";
+type ImageProvider = "openai" | "qwen" | "wan";
+
+function normalizeImageProvider(value?: string): ImageProvider | undefined {
+  const normalized = (value ?? "").toLowerCase().trim();
+  if (normalized === "openai" || normalized === "qwen" || normalized === "wan") {
+    return normalized;
+  }
+  return undefined;
+}
+
+function resolveImageProvider(model?: string): ImageProvider {
+  const value = (model ?? "").toLowerCase();
+  if (value.startsWith("qwen") || value.includes("qwen")) return "qwen";
+  if (value.startsWith("wan") || value.includes("wan")) return "wan";
+  return "openai";
+}
+
+function resolveImageGenerationModel(
+  model: string | undefined,
+  quality: ImageQuality = "medium",
+  explicitProvider?: ImageProvider,
+) {
+  const selectedModel = (model ?? "").toLowerCase();
+  const modelProvider = selectedModel.startsWith("qwen-image-")
+    ? "qwen" as const
+    : selectedModel.startsWith("wan")
+      ? "wan" as const
+      : selectedModel.startsWith("gpt-image-")
+        ? "openai" as const
+        : undefined;
+  // A normal chat model is only the conversation model. Image requests from
+  // that context always use the default GPT Image 2 Low path.
+  const provider = modelProvider ?? (selectedModel ? "openai" : explicitProvider ?? "openai");
+  if (modelProvider && explicitProvider && modelProvider !== explicitProvider) {
+    throw new ApiError(400, `Selected image model ${model} does not belong to provider ${explicitProvider}.`);
+  }
+  if (provider === "qwen") {
+    return {
+      provider: "qwen" as const,
+      model: modelProvider === "qwen" ? model : QWEN_IMAGE_MODELS[quality],
+      size: quality === "low" ? "1024*1024" : quality === "medium" ? "1536*1536" : "2048*2048",
+    };
+  }
+  if (provider === "wan") {
+    return {
+      provider: "wan" as const,
+      model: modelProvider === "wan" ? model : WAN_IMAGE_MODELS[quality],
+      size: quality === "low" ? "1024x1024" : quality === "medium" ? "1536x1536" : "2048x2048",
+    };
+  }
+  return {
+    provider: "openai" as const,
+    model: modelProvider === "openai" ? (model === "gpt-image-2" ? model : OPENAI_IMAGE_MODEL) : OPENAI_IMAGE_MODEL,
+    size: "1024x1024",
+    quality,
+  };
+}
+
+function resolveImageResponseModel(
+  model: string | undefined,
+  quality: ImageQuality = "low",
+): string {
+  const normalized = (model ?? "").toLowerCase();
+  if (normalized.startsWith("qwen-image-") || normalized.startsWith("wan")) return model!;
+  return `gpt-image-2-${quality}`;
+}
+
+function resolveImageEditModel(model: string | undefined, explicitProvider?: ImageProvider) {
+  const selectedModel = (model ?? "").toLowerCase();
+  const modelProvider = selectedModel.startsWith("qwen-image-")
+    ? "qwen" as const
+    : selectedModel.startsWith("wan")
+      ? "wan" as const
+      : selectedModel.startsWith("gpt-image-")
+        ? "openai" as const
+        : undefined;
+  if (modelProvider && explicitProvider && modelProvider !== explicitProvider) {
+    throw new ApiError(400, `Selected image model ${model} does not belong to provider ${explicitProvider}.`);
+  }
+  const provider = modelProvider ?? explicitProvider ?? resolveImageProvider(model);
+  if (provider === "qwen") {
+    return { provider: "qwen" as const, model: model?.startsWith("qwen-image-") ? model : "qwen-image-plus", size: "2048*2048" };
+  }
+  if (provider === "wan") {
+    return { provider: "wan" as const, model: model?.startsWith("wan") ? model : "wan2.7-image-pro", size: "2048x2048" };
+  }
+  return { provider: "openai" as const, model: OPENAI_IMAGE_MODEL, size: "1024x1024" };
+}
+
+function imageProviderError(operation: "generation" | "edit", err: any): ApiError {
+  const message = err?.message || "Unknown provider error";
+  const status = err?.status;
+  if (status === 400) return ApiError.badRequest(`Image ${operation} request rejected: ${message}`);
+  if (status === 401 || status === 403) return ApiError.internal(`Image provider authentication failed: ${message}`);
+  if (status === 429) return new ApiError(429, `Image provider rate limit or quota exceeded: ${message}`);
+  return new ApiError(502, `Image ${operation} provider failed: ${message}`);
+}
 
 /** Pick the right provider based on the model ID prefix. */
 function getProvider(model: string) {
@@ -393,30 +506,74 @@ async function resolveImageToBuffer(imageRef: string): Promise<{ buffer: Buffer;
  * Image generation always uses gpt-image-2. The user's selected model is only
  * used for chat/text responses, not for pixel generation.
  */
-async function editImage(previousImageRef: string, prompt: string, apiKeyOverride?: string): Promise<string> {
+async function editGeneratedImage(
+  previousImageRef: string,
+  prompt: string,
+  selectedModel?: string,
+  providerOverride?: ImageProvider,
+  apiKeyOverride?: string,
+): Promise<string> {
   const t0 = Date.now();
   console.log(`[IMAGE_EDIT] editImage START — imageRef="${previousImageRef.slice(0, 80)}" len=${previousImageRef.length}`);
 
-  const client = getOpenAIClient(apiKeyOverride);
-
-  // ── Step 1: resolve reference → Buffer ───────────────────────────────────
   const t1 = Date.now();
   const { buffer, mime } = await resolveImageToBuffer(previousImageRef);
   console.log(`[IMAGE_EDIT] resolve image: ${Date.now() - t1}ms — mime=${mime} bufferBytes=${buffer.length}`);
 
-  // ── Step 2: wrap Buffer as Uploadable File ────────────────────────────────
+  const requestConfig = resolveImageEditModel(selectedModel, providerOverride);
+  if (requestConfig.provider === "qwen") {
+    const apiKey = apiKeyOverride ?? env.QWEN_API_KEY;
+    if (!apiKey) throw ApiError.internal("QWEN_API_KEY is not configured.");
+    const imageContent = /^https?:\/\//i.test(previousImageRef)
+      ? previousImageRef
+      : `data:${mime};base64,${buffer.toString("base64")}`;
+    const model = requestConfig.model === "qwen-image-plus" ? "qwen-image-edit-plus" : requestConfig.model;
+    const response = await fetch(`${env.QWEN_API_BASE_URL.replace(/\/$/, "")}/services/aigc/multimodal-generation/generation`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        input: {
+          messages: [{
+            role: "user",
+            content: [
+              { image: imageContent },
+              { text: prompt },
+            ],
+          }],
+        },
+        parameters: { n: 1, size: requestConfig.size, watermark: false, prompt_extend: true },
+      }),
+    });
+    const responseText = await response.text();
+    let body: any = {};
+    try { body = responseText ? JSON.parse(responseText) : {}; } catch { body = { message: responseText }; }
+    if (!response.ok) throw imageProviderError("edit", Object.assign(new Error(body.message || body.code || "Qwen image edit failed"), { status: response.status }));
+    const imageUrl = body.output?.choices?.[0]?.message?.content?.find(
+      (content: { image?: string }) => content.image,
+    )?.image;
+    if (!imageUrl) throw ApiError.internal("Qwen image edit returned no image URL");
+    const imageResponse = await fetch(imageUrl);
+    if (!imageResponse.ok) throw ApiError.internal(`Qwen image download failed with status ${imageResponse.status}`);
+    const editedBuffer = Buffer.from(await imageResponse.arrayBuffer());
+    return uploadImageToCloudinary(editedBuffer, { folder: "omniai/generated" });
+  }
+  if (requestConfig.provider === "wan") {
+    throw new ApiError(501, "Wan image editing is not enabled in this phase.");
+  }
+
+  const client = getOpenAIClient(apiKeyOverride);
   const t2 = Date.now();
   const imageFile = await toFile(buffer, "reference.png", { type: mime });
   console.log(`[IMAGE_EDIT] toFile: ${Date.now() - t2}ms`);
 
-  // ── Step 3: OpenAI images.edit API call ──────────────────────────────────
   const t3 = Date.now();
   console.log(`[IMAGE_EDIT] provider API request START — model=gpt-image-2 prompt="${prompt.slice(0, 80)}"`);
 
   let response;
   try {
     response = await client.images.edit({
-      model: "gpt-image-2",
+      model: requestConfig.model,
       image: imageFile,
       prompt,
       n: 1,
@@ -431,7 +588,6 @@ async function editImage(previousImageRef: string, prompt: string, apiKeyOverrid
   const item = response.data?.[0];
   if (!item) throw ApiError.internal("Image edit returned no result");
 
-  // ── Step 4: get raw image bytes from the response ─────────────────────────
   const t4 = Date.now();
   let rawBuffer: Buffer;
 
@@ -447,7 +603,6 @@ async function editImage(previousImageRef: string, prompt: string, apiKeyOverrid
     throw ApiError.internal("Image edit returned no usable data");
   }
 
-  // ── Step 5: upload to Cloudinary ─────────────────────────────────────────
   const t5 = Date.now();
   const cloudinaryUrl = await uploadImageToCloudinary(rawBuffer, { folder: "omniai/generated" });
   console.log(`[IMAGE_EDIT] Cloudinary upload: ${Date.now() - t5}ms — url=${cloudinaryUrl}`);
@@ -456,32 +611,133 @@ async function editImage(previousImageRef: string, prompt: string, apiKeyOverrid
   return cloudinaryUrl;
 }
 
-/**
- * Generate a new image using gpt-image-2.
- * Image generation always uses gpt-image-2 regardless of selected chat model.
- */
-async function generateImage(prompt: string, apiKeyOverride?: string): Promise<string> {
+async function generateImage(
+  prompt: string,
+  quality: ImageQuality = "medium",
+  selectedModel?: string,
+  providerOverride?: ImageProvider,
+  apiKeyOverride?: string,
+): Promise<string> {
+  const requestConfig = resolveImageGenerationModel(selectedModel, quality, providerOverride);
+
+  if (requestConfig.provider === "qwen") {
+    const apiKey = apiKeyOverride ?? env.QWEN_API_KEY;
+    if (!apiKey) throw ApiError.internal("QWEN_API_KEY is not configured.");
+    const baseUrl = env.QWEN_API_BASE_URL.replace(/\/$/, "");
+
+    async function qwenRequest(url: string, init?: RequestInit): Promise<any> {
+      const response = await fetch(url, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          ...(init?.headers ?? {}),
+        },
+      });
+      const responseText = await response.text();
+      let body: any = {};
+      try {
+        body = responseText ? JSON.parse(responseText) : {};
+      } catch {
+        body = { message: responseText };
+      }
+      if (!response.ok) {
+        const error = new Error(body.message || body.code || `Qwen request failed with status ${response.status}`) as Error & { status?: number };
+        error.status = response.status;
+        throw error;
+      }
+      return body;
+    }
+
+    try {
+      const isQwenImage30 = requestConfig.model === "qwen-image-3.0" || requestConfig.model === "qwen-image-3.0-pro";
+      if (isQwenImage30) {
+        const response = await qwenRequest(`${baseUrl}/services/aigc/multimodal-generation/generation`, {
+          method: "POST",
+          body: JSON.stringify({
+            model: requestConfig.model,
+            input: {
+              messages: [{ role: "user", content: [{ text: prompt.slice(0, 800) }] }],
+            },
+            parameters: { size: requestConfig.size, watermark: false, prompt_extend: true },
+          }),
+        });
+        const imageUrl = response.output?.choices?.[0]?.message?.content?.find(
+          (content: { image?: string }) => content.image,
+        )?.image;
+        if (!imageUrl) throw new Error("Qwen Image 3.0 returned no image URL");
+        const imageResponse = await fetch(imageUrl);
+        if (!imageResponse.ok) throw new Error(`Qwen image download failed with status ${imageResponse.status}`);
+        const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
+        return uploadImageToCloudinary(imageBuffer, { folder: "omniai/generated" });
+      }
+
+      const taskResponse = await qwenRequest(`${baseUrl}/services/aigc/text2image/image-synthesis`, {
+        method: "POST",
+        headers: { "X-DashScope-Async": "enable" },
+        body: JSON.stringify({
+          model: requestConfig.model,
+          input: { prompt },
+          parameters: { size: requestConfig.size, n: 1, watermark: false, prompt_extend: true },
+        }),
+      });
+
+      const taskId = taskResponse.output?.task_id;
+      if (!taskId) {
+        throw new Error(taskResponse.message || "Qwen did not return an image task ID");
+      }
+
+      for (let poll = 0; poll < QWEN_IMAGE_MAX_POLLS; poll++) {
+        await new Promise((resolve) => setTimeout(resolve, QWEN_IMAGE_POLL_INTERVAL_MS));
+        const result = await qwenRequest(`${baseUrl}/tasks/${taskId}`);
+        const output = result.output ?? {};
+        if (output.task_status === "FAILED" || output.task_status === "CANCELED") {
+          throw new Error(result.message || `Qwen image task ${output.task_status.toLowerCase()}`);
+        }
+        if (output.task_status !== "SUCCEEDED") continue;
+
+        const imageUrl = output.results?.[0]?.url;
+        if (!imageUrl) throw new Error("Qwen image task succeeded without an image URL");
+        const imageResponse = await fetch(imageUrl);
+        if (!imageResponse.ok) throw new Error(`Qwen image download failed with status ${imageResponse.status}`);
+        const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
+        return uploadImageToCloudinary(imageBuffer, { folder: "omniai/generated" });
+      }
+      throw new Error("Qwen image generation timed out while waiting for the task result");
+    } catch (err: any) {
+      console.error("[QWEN IMAGE GENERATION ERROR]", err?.message || err);
+      throw imageProviderError("generation", err);
+    }
+  }
+
+  if (requestConfig.provider === "wan") {
+    throw new ApiError(501, "Wan image generation is not enabled in this phase.");
+  }
+
   const client = getOpenAIClient(apiKeyOverride);
-  let response;
+
+  let response: Awaited<ReturnType<typeof client.images.generate>>;
   try {
     response = await client.images.generate({
-      model: "gpt-image-2",
+      model: requestConfig.model,
       prompt,
       n: 1,
-      size: "1024x1024",
+      size: requestConfig.size,
+      quality: requestConfig.quality,
       response_format: "b64_json",
     });
   } catch (err: any) {
-    // Fallback without response_format
     try {
       response = await client.images.generate({
-        model: "gpt-image-2",
+        model: requestConfig.model,
         prompt,
         n: 1,
-        size: "1024x1024",
+        size: requestConfig.size,
+        quality: requestConfig.quality,
       });
     } catch (err2: any) {
-      throw ApiError.badRequest(`Image generation failed: ${err2.message || "Unknown provider error"}`);
+      console.error("[IMAGE GENERATION ERROR]", err2?.message || err2);
+      throw imageProviderError("generation", err2);
     }
   }
 
@@ -504,7 +760,6 @@ async function generateImage(prompt: string, apiKeyOverride?: string): Promise<s
     throw ApiError.internal("Image generation returned no usable data");
   }
 
-  // Upload to Cloudinary and return a persistent HTTPS URL
   const cloudinaryUrl = await uploadImageToCloudinary(rawBuffer, { folder: "omniai/generated" });
   return cloudinaryUrl;
 }
@@ -603,6 +858,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   }
 
   console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent} hasAttachedImages=${hasAttachedImages}`);
+  console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
 
   const wantsImage = intent === "NEW_IMAGE";
   const wantsModification = intent === "IMAGE_MODIFICATION";
@@ -612,6 +868,8 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const attachedImageUrl = imageParts[0]?.image_url.url ?? null;
   const previousImageUrl = wantsModification
     ? (attachedImageUrl ?? (input.conversationId ? await findPreviousGeneratedImage(input.conversationId) : null))
+  const previousImageUrl = wantsModification && input.conversationId
+    ? await findPreviousGeneratedImage(input.conversationId)
     : null;
 
   const isModification = wantsModification && previousImageUrl !== null;
@@ -644,19 +902,31 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     conversation.id as string, "user", dbUserMessage, input.model,
     userImageUrl, docAttachment?.url, docAttachment?.name,
   );
+  const provider = getProvider(input.model);
+
+  const provider = getProvider(input.model);
+
+  await conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl);
   const history = isImageOp
     ? []
     : await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
 
   let replyText: string;
   let imageUrl: string | undefined;
+  let responseModel = input.model;
 
   if (isModification && previousImageUrl) {
-    // Image-to-image edit: pass the previous image + the user's instruction
-    imageUrl = await editImage(previousImageUrl, input.message);
+    imageUrl = await editGeneratedImage(previousImageUrl, input.message, input.model, normalizeImageProvider(input.provider));
     replyText = "Here is your modified image.";
   } else if (wantsImage) {
-    imageUrl = await generateImage(input.message);
+    responseModel = resolveImageResponseModel(input.model, input.imageQuality);
+    imageUrl = await generateImage(
+      input.message,
+      input.imageQuality,
+      input.model,
+      normalizeImageProvider(input.provider) ?? (input.model ? resolveImageProvider(input.model) : undefined),
+      undefined,
+    );
     replyText = "Here is your generated image.";
   } else {
     const providerMessages: ProviderChatMessage[] = history.map((m, idx) => {
@@ -708,6 +978,8 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const [assistantMessage, updatedUser] = await Promise.all([
     conversationService.appendMessage(conversation.id as string, "assistant", replyText, input.model, imageUrl),
     User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h imageCount24h"),
+    conversationService.appendMessage(conversation.id as string, "assistant", replyText, responseModel, imageUrl),
+    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
   ]);
 
   // Touch conversation timestamp — not in critical path, fire-and-forget
@@ -868,6 +1140,7 @@ export async function* chatStream(
   let streamError: string | null = null;
   // Hoisted outside try so the image-counter update block can see it after the stream ends.
   let didImageOp = false;
+  let responseModel = input.model;
 
   try {
     // Wait for attachment extraction (may already be done).
@@ -978,25 +1251,22 @@ export async function* chatStream(
     if (isModification && previousImageUrl) {
       const tEditStart = Date.now();
       console.log(`[IMAGE_EDIT] modify_image BRANCH START — prevImageUrlLen=${previousImageUrl.length}`);
-
-      generatedImageUrl = await editImage(previousImageUrl, input.message);
-
+      generatedImageUrl = await editGeneratedImage(previousImageUrl, input.message, input.model, normalizeImageProvider(input.provider));
       console.log(`[IMAGE_EDIT] editImage RETURNED — took=${Date.now() - tEditStart}ms resultLen=${generatedImageUrl.length}`);
 
-      // fullReply is the text saved to DB and sent as message content.
-      // The actual image is delivered via generatedImageUrl → done event → imageUrl field.
-      // Do NOT yield a markdown image token here — the frontend renders imageUrl
-      // as a standalone <img> tag, so yielding markdown would produce two images.
       fullReply = "Here is your modified image.";
       yield { type: "token", content: fullReply } as unknown as AIStreamChunk;
 
     // ── Image generation path ────────────────────────────────────────────────
     } else if (wantsImage) {
-      generatedImageUrl = await generateImage(input.message);
-      // fullReply is the text label stored in DB and sent as message content.
-      // The image itself is delivered through generatedImageUrl → done event → imageUrl.
-      // Do NOT yield a markdown image token — that would render a second image
-      // alongside the one the frontend already shows from the imageUrl field.
+      responseModel = resolveImageResponseModel(input.model, input.imageQuality);
+      generatedImageUrl = await generateImage(
+        input.message,
+        input.imageQuality,
+        input.model,
+        normalizeImageProvider(input.provider) ?? (input.model ? resolveImageProvider(input.model) : undefined),
+        undefined,
+      );
       fullReply = "Here is your generated image.";
       yield { type: "token", content: fullReply } as unknown as AIStreamChunk;
     } else {
@@ -1088,12 +1358,9 @@ export async function* chatStream(
   }
 
   // ── 4. Persist assistant message ──────────────────────────────────────────
-  // When a stream error occurs we intentionally save the FALLBACK_ERROR string
-  // rather than the raw provider error message. Storing provider errors (e.g.
-  // "400 InternalError.Algo.InvalidParameter: Range of input length...") would
-  // re-inject them into conversation history on the next turn, potentially
-  // triggering the same failure again on providers like Qwen.
-  const contentToSave = fullReply.trim() || (streamError !== null ? FALLBACK_ERROR : fullReply);
+  // Persist the same sanitized application-level error shown to the user so a
+  // reload does not replace a useful provider rejection with a generic message.
+  const contentToSave = fullReply.trim() || (streamError !== null ? streamError : fullReply);
 
   const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
   if (plan !== "free") {
@@ -1125,6 +1392,8 @@ export async function* chatStream(
   const [assistantMessage, updatedUser] = await Promise.all([
     conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, input.model, generatedImageUrl),
     User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h imageCount24h"),
+    conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, responseModel, generatedImageUrl),
+    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
   ]);
   void conversationService.touchConversation(conversation.id as string);
 
@@ -1197,4 +1466,171 @@ export async function* chatStream(
 }
 
 
+export async function editImage(
+  userId: string,
+  imageInput: Buffer | string,
+  prompt: string,
+  maskInput?: Buffer | string,
+  model?: string,
+  providerOverride?: ImageProvider,
+  apiKeyOverride?: string,
+  conversationId?: string,
+  messageId?: string,
+): Promise<string> {
+  const user = await User.findById(userId).select("subscription imagePlan imageCount24h lastImageResetAt");
+  if (!user) throw ApiError.unauthorized("User no longer exists");
+
+  // No plan restrictions during testing phase — all users can edit images
+  const requestConfig = resolveImageEditModel(model, providerOverride ?? undefined);
+
+  const persistEditedImage = async (resultUrl: string): Promise<string> => {
+    if (!conversationId || !messageId) return resultUrl;
+    const existing = await Message.findOne({ _id: messageId, conversationId });
+    if (!existing) throw ApiError.notFound("The image message could not be found");
+    const { buffer } = await resolveImageToBuffer(resultUrl);
+    const storedUrl = await uploadImageToCloudinary(buffer, { folder: "omniai/generated" });
+    await Message.updateOne(
+      { _id: messageId, conversationId },
+      { $set: { imageUrl: storedUrl, originalImageUrl: existing.originalImageUrl || existing.imageUrl } },
+    );
+    return storedUrl;
+  };
+
+  if (requestConfig.provider === "qwen") {
+    const apiKey = apiKeyOverride ?? env.QWEN_API_KEY;
+    if (!apiKey) throw ApiError.internal("QWEN_API_KEY is not configured.");
+    const baseUrl = env.QWEN_API_BASE_URL.replace(/\/$/, "");
+
+    const toBuffer = async (input: Buffer | string): Promise<Buffer> => {
+      if (Buffer.isBuffer(input)) return input;
+      if (input.startsWith("data:")) {
+        const base64Index = input.indexOf(";base64,");
+        if (base64Index !== -1) return Buffer.from(input.slice(base64Index + 8), "base64");
+      }
+      if (input.startsWith("http://") || input.startsWith("https://")) {
+        const fetchRes = await fetch(input);
+        if (!fetchRes.ok) throw ApiError.badRequest(`Unable to download image for editing (HTTP ${fetchRes.status})`);
+        return Buffer.from(await fetchRes.arrayBuffer());
+      }
+      const buffer = Buffer.from(input, "base64");
+      if (buffer.length === 0) throw ApiError.badRequest("Invalid image input");
+      return buffer;
+    };
+
+    try {
+      const imageBuffer = await toBuffer(imageInput);
+      const imageContent = typeof imageInput === "string" && /^https?:\/\//i.test(imageInput)
+        ? imageInput
+        : `data:image/png;base64,${imageBuffer.toString("base64")}`;
+      const model = requestConfig.model === "qwen-image-plus" ? "qwen-image-edit-plus" : requestConfig.model;
+      const response = await fetch(`${baseUrl}/services/aigc/multimodal-generation/generation`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          input: {
+            messages: [{
+              role: "user",
+              content: [{ image: imageContent }, { text: prompt }],
+            }],
+          },
+          parameters: { n: 1, size: requestConfig.size, watermark: false, prompt_extend: true },
+        }),
+      });
+      const responseText = await response.text();
+      let body: any = {};
+      try { body = responseText ? JSON.parse(responseText) : {}; } catch { body = { message: responseText }; }
+      if (!response.ok) {
+        const error = new Error(body.message || body.code || `Qwen image edit failed with status ${response.status}`) as Error & { status?: number };
+        error.status = response.status;
+        throw error;
+      }
+      const imageUrl = body.output?.choices?.[0]?.message?.content?.find(
+        (content: { image?: string }) => content.image,
+      )?.image;
+      if (!imageUrl) throw new Error("Qwen image edit returned no image URL");
+      return persistEditedImage(imageUrl);
+    } catch (err: any) {
+      console.error("[QWEN IMAGE EDIT ERROR]", err?.message || err);
+      throw imageProviderError("edit", err);
+    }
+  }
+
+  if (requestConfig.provider === "wan") {
+    throw new ApiError(501, "Wan image editing is not enabled in this phase.");
+  }
+
+  const client = getOpenAIClient(apiKeyOverride);
+
+  const toBuffer = async (input: Buffer | string): Promise<Buffer> => {
+    if (Buffer.isBuffer(input)) return input;
+    if (typeof input === "string") {
+      if (input.startsWith("data:")) {
+        const base64Index = input.indexOf(";base64,");
+        if (base64Index !== -1) {
+          const buffer = Buffer.from(input.slice(base64Index + 8), "base64");
+          if (buffer.length === 0) throw ApiError.badRequest("Invalid base64 image data");
+          return buffer;
+        }
+      }
+      if (input.startsWith("http://") || input.startsWith("https://")) {
+        const fetchRes = await fetch(input);
+        if (!fetchRes.ok) {
+          throw ApiError.badRequest(`Unable to download image for editing (HTTP ${fetchRes.status})`);
+        }
+        const arrayBuf = await fetchRes.arrayBuffer();
+        return Buffer.from(arrayBuf);
+      }
+      const buffer = Buffer.from(input, "base64");
+      if (buffer.length === 0) throw ApiError.badRequest("Invalid base64 image data");
+      return buffer;
+    }
+    throw ApiError.badRequest("Invalid image input");
+  };
+
+  const imageBuffer = await toBuffer(imageInput);
+  const maskBuffer = maskInput ? await toBuffer(maskInput) : undefined;
+
+  const imageFile = await toFile(imageBuffer, "image.png", { type: "image/png" });
+  const maskFile = maskBuffer ? await toFile(maskBuffer, "mask.png", { type: "image/png" }) : undefined;
+
+  let response: Awaited<ReturnType<typeof client.images.edit>>;
+  try {
+    response = await client.images.edit({
+      model: requestConfig.model,
+      image: imageFile,
+      ...(maskFile ? { mask: maskFile } : {}),
+      prompt: prompt,
+      n: 1,
+      size: requestConfig.size,
+    } as any);
+  } catch (err: any) {
+    console.error("[IMAGE EDIT ERROR]", err?.message || err);
+    throw imageProviderError("edit", err);
+  }
+
+  const item = response.data?.[0];
+  if (!item) throw ApiError.internal("Image edit returned no result");
+
+  if (item.b64_json) {
+    return persistEditedImage(`data:image/png;base64,${item.b64_json}`);
+  }
+
+  if (item.url) {
+    try {
+      const imgRes = await fetch(item.url);
+      const arrayBuffer = await imgRes.arrayBuffer();
+      const base64 = Buffer.from(arrayBuffer).toString("base64");
+      const contentType = imgRes.headers.get("content-type") || "image/png";
+      return `data:${contentType};base64,${base64}`;
+    } catch (err) {
+      return persistEditedImage(item.url);
+    }
+  }
+
+  throw ApiError.internal("Image edit returned no usable image data");
+}
 

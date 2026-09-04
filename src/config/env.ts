@@ -30,6 +30,7 @@ const envSchema = z.object({
 
   // Optional — only required when Qwen models are used
   QWEN_API_KEY: z.string().optional(),
+  QWEN_API_BASE_URL: z.string().url().default("https://dashscope-intl.aliyuncs.com/api/v1"),
 
   // Optional — only required when Mistral models are used
   MISTRAL_API_KEY: z.string().optional(),

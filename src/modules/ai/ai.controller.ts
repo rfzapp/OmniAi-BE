@@ -128,3 +128,40 @@ export async function chatStreamHandler(req: Request, res: Response) {
     if (!res.writableEnded) res.end();
   }
 }
+
+export async function editImageHandler(req: Request, res: Response) {
+  if (!req.user) throw ApiError.unauthorized();
+
+  const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+  const imageFile = files?.image?.[0];
+  const maskFile = files?.mask?.[0];
+
+  const imageInput: Buffer | string = imageFile ? imageFile.buffer : (req.body.image as string);
+  const maskInput: Buffer | string | undefined = maskFile ? maskFile.buffer : (req.body.mask as string | undefined);
+  const prompt = req.body.prompt;
+  const model = req.body.model as string | undefined;
+  const provider = req.body.provider as string | undefined;
+  const conversationId = req.body.conversationId as string | undefined;
+  const messageId = req.body.messageId as string | undefined;
+
+  if (!imageInput) {
+    throw ApiError.badRequest("Image file or image URL is required");
+  }
+
+  const imageUrl = await aiService.editImage(
+    req.user.id,
+    imageInput,
+    prompt,
+    maskInput,
+    model,
+    (provider && ["openai", "qwen", "wan"].includes(provider) ? provider as "openai" | "qwen" | "wan" : undefined),
+    undefined,
+    conversationId,
+    messageId,
+  );
+
+  sendSuccess(res, 200, "Image edited successfully", {
+    imageUrl,
+  });
+}
+

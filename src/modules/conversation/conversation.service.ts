@@ -13,8 +13,22 @@ function buildTitle(firstMessage: string): string {
   return trimmed.length > TITLE_MAX_LENGTH ? `${trimmed.slice(0, TITLE_MAX_LENGTH)}…` : trimmed;
 }
 
-export async function listConversations(userId: string) {
-  return Conversation.find({ userId }).sort({ isPinned: -1, updatedAt: -1 });
+export async function listConversations(userId: string, limit = 50, skip = 0) {
+  const conversations = await Conversation.find({ userId })
+    .select("title model isPinned createdAt updatedAt")
+    .sort({ isPinned: -1, updatedAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .lean();
+
+  return conversations.map((c: any) => ({
+    id: c._id.toString(),
+    title: c.title,
+    model: c.model,
+    isPinned: Boolean(c.isPinned),
+    createdAt: c.createdAt ? new Date(c.createdAt).toISOString() : new Date().toISOString(),
+    updatedAt: c.updatedAt ? new Date(c.updatedAt).toISOString() : new Date().toISOString(),
+  }));
 }
 
 export async function getConversationForUser(userId: string, conversationId: string) {
@@ -23,15 +37,36 @@ export async function getConversationForUser(userId: string, conversationId: str
   return conversation;
 }
 
-export async function listMessages(userId: string, conversationId: string) {
-  // Run ownership check and message fetch in parallel — both are reads
+export async function listMessages(userId: string, conversationId: string, limit = 100, before?: string) {
+  const query: Record<string, any> = { conversationId };
+  if (before) {
+    query.createdAt = { $lt: new Date(before) };
+  }
+
+  // Run ownership check and message fetch in parallel
   const [, messages] = await Promise.all([
     getConversationForUser(userId, conversationId),
     Message.find({ conversationId }, { role: 1, content: 1, model: 1, imageUrl: 1, attachmentUrl: 1, attachmentName: 1, createdAt: 1 }).sort({ createdAt: 1 }),
+    Message.find(
+      query,
+      { role: 1, content: 1, model: 1, imageUrl: 1, originalImageUrl: 1, createdAt: 1 }
+    )
+      .sort({ createdAt: before ? -1 : 1 })
+      .limit(limit)
+      .lean(),
   ]);
-  return messages.map((m) => ({
-    ...m.toJSON(),
+
+  const sorted = before ? (messages as any[]).reverse() : messages;
+
+  return (sorted as any[]).map((m) => ({
+    id: m._id.toString(),
+    conversationId: m.conversationId?.toString() || conversationId,
+    role: m.role,
     content: safeDecrypt(m.content),
+    model: m.model,
+    imageUrl: m.imageUrl || null,
+    originalImageUrl: m.originalImageUrl || null,
+    createdAt: m.createdAt ? new Date(m.createdAt).toISOString() : new Date().toISOString(),
   }));
 }
 
@@ -66,9 +101,9 @@ export async function getRecentMessages(conversationId: string, limit: number) {
   const messages = await Message.find(
     { conversationId },
     { role: 1, content: 1, model: 1, imageUrl: 1, attachmentUrl: 1, attachmentName: 1, createdAt: 1 },
+    { role: 1, content: 1, model: 1, imageUrl: 1, originalImageUrl: 1, createdAt: 1 },
   ).sort({ createdAt: -1 }).limit(limit);
   return messages.reverse().map((m) => ({
-    ...m.toObject(),
     id: (m as any).id as string,
     role: m.role,
     content: safeDecrypt(m.content),
