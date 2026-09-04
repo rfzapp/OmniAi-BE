@@ -1,5 +1,8 @@
 import { ApiError } from "../../utils/ApiError";
-import { getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit, getPromptCharLimit } from "../../config/plans";
+import {
+  getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit, getPromptCharLimit,
+  isModelAccessible, getRequiredPlanForModel, capitalizePlan, normalizePlan,
+} from "../../config/plans";
 import { User } from "../user/user.model";
 import { Message } from "../message/message.model";
 import * as conversationService from "../conversation/conversation.service";
@@ -13,7 +16,7 @@ import { kimiProvider } from "./providers/kimi.provider";
 import { getOpenAIClient } from "../../config/openai";
 import { env } from "../../config/env";
 import OpenAI from "openai";
-import { uploadImageToCloudinary, downloadImageFromCloudinary } from "../../config/cloudinary";
+import { uploadImageToCloudinary, downloadImageFromCloudinary, uploadDocumentToCloudinary } from "../../config/cloudinary";
 import { toFile } from "openai/core/uploads";
 import type { AIStreamChunk } from "./providers/provider.types";
 
@@ -304,6 +307,38 @@ async function buildImageContentParts(files: Express.Multer.File[] | undefined):
 }
 
 /**
+ * Upload a non-image file attachment (PDF, DOCX, XLSX, TXT, etc.) to Cloudinary
+ * and return the persistent URL + original filename for storage in the message.
+ *
+ * Returns null if no non-image file is present so callers can skip the upload
+ * without branching on file type themselves.
+ */
+async function buildDocumentAttachment(files: Express.Multer.File[] | undefined): Promise<{ url: string; name: string } | null> {
+  if (!files || files.length === 0) return null;
+
+  // Find the first non-image file
+  const docFile = files.find((file) => {
+    const mime = (file.mimetype || "").toLowerCase();
+    const ext = (file.originalname || "").toLowerCase();
+    const isImage =
+      mime.startsWith("image/") ||
+      ext.endsWith(".png") || ext.endsWith(".jpg") || ext.endsWith(".jpeg") ||
+      ext.endsWith(".webp") || ext.endsWith(".gif");
+    return !isImage;
+  });
+
+  if (!docFile) return null;
+
+  const name = docFile.originalname || docFile.fieldname || "attachment";
+  const url = await uploadDocumentToCloudinary(docFile.buffer, name, {
+    folder: "omniai/documents",
+  });
+
+  console.log(`[ATTACHMENT] Uploaded document to Cloudinary: name=${name} size=${docFile.size}`);
+  return { url, name };
+}
+
+/**
  * Looks back through the conversation's persisted messages and returns the
  * imageUrl of the most recent assistant message that has one.  Returns null
  * when no prior generated image exists (fresh conversation, or the user has
@@ -477,16 +512,27 @@ async function generateImage(prompt: string, apiKeyOverride?: string): Promise<s
 export async function chat(userId: string, input: ChatInput, files?: Express.Multer.File[]) {
   const timer = new LatencyTimer('chat');
   timer.start();
-  const user = await User.findById(userId).select("subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt preferences.memoryEnabled memories");
+  const user = await User.findById(userId).select("subscription promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt preferences.memoryEnabled memories");
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
+  // Normalize legacy plan names (standard ? starter, ultra_pro ? ultra)
+  // so all limit/access checks work for users who signed up before the plan rename.
+  const plan = normalizePlan(user.subscription as string);
+
   // Enforce per-message character limit based on plan
-  const charLimit = getPromptCharLimit(user.subscription);
+  const charLimit = getPromptCharLimit(plan);
   if (input.message.length > charLimit) {
-    throw new ApiError(403, `Message exceeds the ${charLimit.toLocaleString()}-character limit for your plan. Upgrade to Ultra Pro for up to 8,000 characters per message.`);
+    throw new ApiError(403, `Your message exceeds the ${charLimit.toLocaleString()}-character limit for the ${capitalizePlan(plan)} plan. Upgrade your plan for a higher limit.`);
   }
 
-  const limit = getPromptLimit(user.subscription);
+  // Enforce model access based on subscription plan
+  if (!isModelAccessible(input.model, plan)) {
+    const required = getRequiredPlanForModel(input.model);
+    const reqLabel = required ? capitalizePlan(required) : "higher";
+    throw new ApiError(403, `MODEL_LOCKED:${reqLabel}|This model is not available on your ${capitalizePlan(plan)} plan. Upgrade to ${reqLabel} to access it.`);
+  }
+
+  const limit = getPromptLimit(plan);
 
   const now = new Date();
   const resetInterval = 30 * 24 * 60 * 60 * 1000; // 30-day rolling window
@@ -498,24 +544,24 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   let attachmentCount24h = needsReset ? 0 : (user.attachmentCount24h || 0);
 
   const freePromptLimit = limit ?? 3;
-  if (user.subscription === "free") {
+  if (plan === "free") {
     // Free plan uses promptCount (all-time lifetime total) — 3 prompts forever, no reset
     if (user.promptCount >= freePromptLimit) {
       throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
     }
     if (files && files.length > 0) {
-      throw new ApiError(403, "File attachments are not allowed on the Free plan. Please upgrade to Standard or higher.");
+      throw new ApiError(403, "File attachments are not available on the Free plan. Upgrade your plan to attach files.");
     }
   } else {
     const promptLimit = limit;
     if (promptLimit !== null && (promptCount24h + 1) > promptLimit) {
-      throw new ApiError(403, `Monthly prompt limit reached for your ${user.subscription} plan (${promptLimit} prompts/month). Limit resets every 30 days.`);
+      throw new ApiError(403, `Monthly prompt limit reached for your ${capitalizePlan(plan)} plan (${promptLimit} prompts/month). Upgrade your plan to continue.`);
     }
 
-    const attachmentLimit = getAttachmentLimit(user.subscription);
+    const attachmentLimit = getAttachmentLimit(plan);
     const attachmentsCount = files ? files.length : 0;
     if ((attachmentCount24h + attachmentsCount) > attachmentLimit) {
-      throw new ApiError(403, `Monthly file attachment limit reached for your ${user.subscription} plan (${attachmentLimit} attachments).`);
+      throw new ApiError(403, `Monthly file attachment limit reached for your ${capitalizePlan(plan)} plan (${attachmentLimit} attachments/month). Upgrade your plan for more.`);
     }
   }
 
@@ -526,60 +572,78 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   ]);
 
   const memoryContext = buildMemoryContext(user);
-  const dbUserMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
+  // dbUserMessage = only the user's typed prompt — no file content stored in DB.
+  // File text is injected into aiPromptMessage for the AI only, never persisted,
+  // so it never appears in the message bubble on reload.
+  const dbUserMessage = input.message;
   const aiPromptMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
 
   const imageParts = await buildImageContentParts(files);
   const hasAttachedImages = imageParts.length > 0;
 
   // ── Intent classification ────────────────────────────────────────────────
-  // If the user attached an image file, this is always a vision/understanding
-  // request — never image generation. Skip the classifier in that case.
+  // When the user attaches an image AND says something like "change the suit
+  // color to gray", the attached image is their reference — classify as
+  // IMAGE_MODIFICATION and route to editImage().
+  // We still run the classifier (with hasPreviousImage=true for attached images)
+  // so "describe this image" correctly stays as NORMAL_CHAT/IMAGE_ANALYSIS.
   let intent = "NORMAL_CHAT";
 
-  if (!hasAttachedImages) {
+  if (hasAttachedImages) {
+    // Attached image acts as the reference — always treat as hasPreviousImage=true
+    intent = await classifyImageIntent(input.message, true);
+    // If the classifier didn't detect a modification request, fall back to
+    // vision analysis (the original behaviour for "describe this image" etc.)
+    if (intent === "NORMAL_CHAT") intent = "IMAGE_ANALYSIS";
+  } else {
     const hasPrevImage = input.conversationId
       ? (await findPreviousGeneratedImage(input.conversationId)) !== null
       : false;
     intent = await classifyImageIntent(input.message, hasPrevImage);
-  } else {
-    intent = "IMAGE_ANALYSIS";
   }
-  
-  console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
+
+  console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent} hasAttachedImages=${hasAttachedImages}`);
 
   const wantsImage = intent === "NEW_IMAGE";
   const wantsModification = intent === "IMAGE_MODIFICATION";
 
-  // Only look up the previous image URL when we actually need it.
-  const previousImageUrl = wantsModification && input.conversationId
-    ? await findPreviousGeneratedImage(input.conversationId)
+  // For modification: prefer the attached image URL; fall back to the last
+  // generated image in the conversation (existing behaviour).
+  const attachedImageUrl = imageParts[0]?.image_url.url ?? null;
+  const previousImageUrl = wantsModification
+    ? (attachedImageUrl ?? (input.conversationId ? await findPreviousGeneratedImage(input.conversationId) : null))
     : null;
 
   const isModification = wantsModification && previousImageUrl !== null;
   const isImageOp = wantsImage || isModification;
 
-  if (isImageOp && !canGenerateImages(user.imagePlan)) {
-    throw new ApiError(403, "Image generation requires an Image Generation plan. Please subscribe to unlock it.");
+  if (isImageOp && !canGenerateImages(plan)) {
+    throw new ApiError(403, "Image generation is not available on the Free plan. Upgrade your plan to generate images.");
   }
 
   if (isImageOp) {
-    const imageLimit = getImageLimit(user.imagePlan);
+    const imageLimit = getImageLimit(plan);
     const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
     const imageCount = (now.getTime() - lastImageReset.getTime() >= resetInterval)
       ? 0
       : (user.imageCount24h ?? 0);
     if (imageCount >= imageLimit) {
-      throw new ApiError(403, `Monthly image limit reached for your plan (${imageLimit} images/month). Upgrade your Image Generation plan for more.`);
+      throw new ApiError(403, `Monthly image generation limit reached for your ${capitalizePlan(plan)} plan (${imageLimit} images/month). Upgrade your plan for more.`);
     }
   }
 
   const userImageUrl = imageParts[0]?.image_url.url;
 
+  // Upload non-image document to Cloudinary so it can be shown on reload
+  const docAttachment = await buildDocumentAttachment(files);
+
   const provider = getProvider(input.model);
 
   // Append clean user message to DB first, then fetch history for AI context
-  await conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl);
+  await conversationService.appendMessage(
+    conversation.id as string, "user", dbUserMessage, input.model,
+    userImageUrl, docAttachment?.url, docAttachment?.name,
+  );
   const history = isImageOp
     ? []
     : await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
@@ -618,7 +682,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     $inc: { promptCount: 1 },
   };
 
-  if (user.subscription !== "free") {
+  if (plan !== "free") {
     if (needsReset) {
       updateFields.$set = {
         promptCount24h: 1,
@@ -643,7 +707,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
 
   const [assistantMessage, updatedUser] = await Promise.all([
     conversationService.appendMessage(conversation.id as string, "assistant", replyText, input.model, imageUrl),
-    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
+    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h imageCount24h"),
   ]);
 
   // Touch conversation timestamp — not in critical path, fire-and-forget
@@ -651,6 +715,33 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
 
   const promptsUsed = updatedUser?.promptCount ?? user.promptCount + 1;
   const promptsUsed24h = updatedUser?.promptCount24h ?? (promptCount24h + 1);
+  const attachmentsUsed = updatedUser?.attachmentCount24h ?? (attachmentCount24h + (files ? files.length : 0));
+  const imagesUsed = isImageOp
+    ? (updatedUser?.imageCount24h ?? ((user.imageCount24h ?? 0) + 1))
+    : (user.imageCount24h ?? 0);
+
+  // Build full usage object
+  const promptLimit = getPromptLimit(plan);
+  const attachmentLimit = getAttachmentLimit(plan);
+  const imageLimit = getImageLimit(plan);
+
+  const fullUsage = {
+    prompts: {
+      used: plan === "free" ? promptsUsed : promptsUsed24h,
+      limit: promptLimit,
+      unlimited: promptLimit === null,
+    },
+    attachments: {
+      used: attachmentsUsed,
+      limit: attachmentLimit,
+      unlimited: false,
+    },
+    images: {
+      used: imagesUsed,
+      limit: imageLimit,
+      unlimited: false,
+    },
+  };
 
   const assistantPayload = {
     id: String(assistantMessage._id),
@@ -665,11 +756,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     conversation,
     message: assistantPayload,
     imageUrl,
-    usage: {
-      promptsUsed,
-      promptsUsed24h,
-      promptsLimit: limit,
-    },
+    usage: fullUsage,
   };
 }
 
@@ -695,19 +782,30 @@ export async function* chatStream(
   const tUser = new LatencyTimer("User lookup");
   tUser.start();
   const user = await User.findById(userId).select(
-    "subscription imagePlan promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt preferences.memoryEnabled memories",
+    "subscription promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt preferences.memoryEnabled memories",
   );
   tUser.stop();
   console.log(`[CHAT] ${tUser.report()}`);
 
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
-  const charLimit = getPromptCharLimit(user.subscription);
+  // Normalize legacy plan names (standard → starter, ultra_pro → ultra)
+  // so all limit/access checks work for users who signed up before the plan rename.
+  const plan = normalizePlan(user.subscription as string);
+
+  const charLimit = getPromptCharLimit(plan);
   if (input.message.length > charLimit) {
-    throw new ApiError(403, `Message exceeds the ${charLimit.toLocaleString()}-character limit for your plan. Upgrade to Ultra Pro for up to 8,000 characters per message.`);
+    throw new ApiError(403, `Your message exceeds the ${charLimit.toLocaleString()}-character limit for the ${capitalizePlan(plan)} plan. Upgrade your plan for a higher limit.`);
   }
 
-  const limit = getPromptLimit(user.subscription);
+  // Enforce model access based on subscription plan
+  if (!isModelAccessible(input.model, plan)) {
+    const required = getRequiredPlanForModel(input.model);
+    const reqLabel = required ? capitalizePlan(required) : "higher";
+    throw new ApiError(403, `MODEL_LOCKED:${reqLabel}|This model is not available on your ${capitalizePlan(plan)} plan. Upgrade to ${reqLabel} to access it.`);
+  }
+
+  const limit = getPromptLimit(plan);
   const now = new Date();
   const resetInterval = 30 * 24 * 60 * 60 * 1000;
   const originalLastResetAt = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : null;
@@ -715,20 +813,20 @@ export async function* chatStream(
   const promptCount24h = needsReset ? 0 : (user.promptCount24h || 0);
   const attachmentCount24h = needsReset ? 0 : (user.attachmentCount24h || 0);
 
-  if (user.subscription === "free") {
+  if (plan === "free") {
     const freeLimit = limit ?? 3;
     if (user.promptCount >= freeLimit)
       throw new ApiError(403, "Free prompt limit reached. Please upgrade your plan.");
     if (files && files.length > 0)
-      throw new ApiError(403, "File attachments are not allowed on the Free plan. Please upgrade to Standard or higher.");
+      throw new ApiError(403, "File attachments are not available on the Free plan. Upgrade your plan to attach files.");
   } else {
     const promptLimit = limit;
     if (promptLimit !== null && promptCount24h + 1 > promptLimit)
-      throw new ApiError(403, `Monthly prompt limit reached for your ${user.subscription} plan (${promptLimit} prompts/month). Limit resets every 30 days.`);
-    const attachmentLimit = getAttachmentLimit(user.subscription);
+      throw new ApiError(403, `Monthly prompt limit reached for your ${capitalizePlan(plan)} plan (${promptLimit} prompts/month). Upgrade your plan to continue.`);
+    const attachmentLimit = getAttachmentLimit(plan);
     const attachmentsCount = files ? files.length : 0;
     if (attachmentCount24h + attachmentsCount > attachmentLimit)
-      throw new ApiError(403, `Monthly file attachment limit reached for your ${user.subscription} plan (${attachmentLimit} attachments).`);
+      throw new ApiError(403, `Monthly file attachment limit reached for your ${capitalizePlan(plan)} plan (${attachmentLimit} attachments/month). Upgrade your plan for more.`);
   }
 
   // ── 2. Create conversation + kick off attachment processing in parallel ────
@@ -776,13 +874,17 @@ export async function* chatStream(
     const attachmentContext = await attachmentContextPromise;
 
     const memoryContext = buildMemoryContext(user);
-    // dbUserMessage = clean text saved to MongoDB (no memory injected)
-    const dbUserMessage = [input.message, attachmentContext].filter(Boolean).join("\n\n");
-    // aiPromptMessage = full prompt sent to the AI (includes memory)
+    // dbUserMessage = only the user's typed prompt — no file content stored in DB.
+    // File text is injected into aiPromptMessage for the AI only, never persisted,
+    // so it never appears in the message bubble on reload.
+    const dbUserMessage = input.message;
+    // aiPromptMessage = full prompt sent to the AI (includes memory + attachment text)
     const aiPromptMessage = [input.message, memoryContext, attachmentContext].filter(Boolean).join("\n\n");
 
     const imageParts = await buildImageContentParts(files);
     const userImageUrl = imageParts[0]?.image_url.url;
+    // Upload non-image document to Cloudinary so it can be shown on reload
+    const docAttachment = await buildDocumentAttachment(files);
     const provider = getProvider(input.model);
 
     console.log(`[CHAT] model=${input.model} imageParts=${imageParts.length} hasFiles=${(files?.length ?? 0) > 0}`);
@@ -791,14 +893,23 @@ export async function* chatStream(
     tContext.start();
 
     // ── Intent classification (LLM-based) ────────────────────────────────────
-    // IMPORTANT: If the user attached an image file, this is always an image
-    // understanding/vision request — never an image generation request.
-    // Skip the classifier entirely and go straight to the chat/vision path.
+    // When the user attaches an image AND says something like "change the suit
+    // color to gray", the attached image is their reference — classify as
+    // IMAGE_MODIFICATION and route to editImage().
+    // We still run the classifier (with hasPreviousImage=true for attached images)
+    // so "describe this image" correctly stays as NORMAL_CHAT/IMAGE_ANALYSIS.
     const hasAttachedImages = imageParts.length > 0;
 
     let intent = "NORMAL_CHAT";
 
-    if (!hasAttachedImages) {
+    if (hasAttachedImages) {
+      // Attached image acts as the reference — always treat as hasPreviousImage=true
+      const tClassify = Date.now();
+      intent = await classifyImageIntent(input.message, true);
+      console.log(`[IMAGE_EDIT] classifyImageIntent (attached): ${Date.now() - tClassify}ms`);
+      // If no modification detected, fall back to vision analysis
+      if (intent === "NORMAL_CHAT") intent = "IMAGE_ANALYSIS";
+    } else {
       // Only run the LLM classifier when no image file is attached.
       const tHasPrev = Date.now();
       const hasPrevImage = input.conversationId
@@ -809,38 +920,38 @@ export async function* chatStream(
       const tClassify = Date.now();
       intent = await classifyImageIntent(input.message, hasPrevImage);
       console.log(`[IMAGE_EDIT] classifyImageIntent: ${Date.now() - tClassify}ms`);
-    } else {
-      intent = "IMAGE_ANALYSIS";
     }
-    
-    console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
 
-    let wantsImage = intent === "NEW_IMAGE";
-    let wantsModification = intent === "IMAGE_MODIFICATION";
+    console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent} hasAttachedImages=${hasAttachedImages}`);
 
-    // Only fetch the actual image URL when we need it for editing.
+    const wantsImage = intent === "NEW_IMAGE";
+    const wantsModification = intent === "IMAGE_MODIFICATION";
+
+    // For modification: prefer the attached image URL; fall back to the last
+    // generated image in the conversation (existing behaviour).
+    const attachedImageUrl = imageParts[0]?.image_url.url ?? null;
     const tPrevUrl = Date.now();
-    const previousImageUrl = wantsModification && input.conversationId
-      ? await findPreviousGeneratedImage(input.conversationId)
+    const previousImageUrl = wantsModification
+      ? (attachedImageUrl ?? (input.conversationId ? await findPreviousGeneratedImage(input.conversationId) : null))
       : null;
     if (wantsModification) {
-      console.log(`[IMAGE_EDIT] findPreviousGeneratedImage (URL fetch): ${Date.now() - tPrevUrl}ms — found=${previousImageUrl !== null} urlLen=${previousImageUrl?.length ?? 0}`);
+      console.log(`[IMAGE_EDIT] reference image: ${Date.now() - tPrevUrl}ms — fromAttachment=${!!attachedImageUrl} found=${previousImageUrl !== null}`);
     }
 
     const isModification = wantsModification && previousImageUrl !== null;
     const isImageOp = wantsImage || isModification;
     if (isImageOp) didImageOp = true;
 
-    if (isImageOp && !canGenerateImages(user.imagePlan)) {
-      throw new ApiError(403, "Image generation requires an Image Generation plan. Please subscribe to unlock it.");
+    if (isImageOp && !canGenerateImages(plan)) {
+      throw new ApiError(403, "Image generation is not available on the Free plan. Upgrade your plan to generate images.");
     }
 
     if (isImageOp) {
-      const imageLimit = getImageLimit(user.imagePlan);
+      const imageLimit = getImageLimit(plan);
       const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
       const imageCount = now.getTime() - lastImageReset.getTime() >= resetInterval ? 0 : (user.imageCount24h ?? 0);
       if (imageCount >= imageLimit) {
-        throw new ApiError(403, `Monthly image limit reached for your plan (${imageLimit} images/month). Upgrade your Image Generation plan for more.`);
+        throw new ApiError(403, `Monthly image generation limit reached for your ${capitalizePlan(plan)} plan (${imageLimit} images/month). Upgrade your plan for more.`);
       }
     }
 
@@ -849,7 +960,10 @@ export async function* chatStream(
     tHistory.start();
 
     const [, history] = await Promise.all([
-      conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl),
+      conversationService.appendMessage(
+        conversation.id as string, "user", dbUserMessage, input.model,
+        userImageUrl, docAttachment?.url, docAttachment?.name,
+      ),
       (isImageOp ? Promise.resolve([]) : conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT)).then((res) => {
         tHistory.stop();
         console.log(`[CHAT] ${tHistory.report()}`);
@@ -982,7 +1096,7 @@ export async function* chatStream(
   const contentToSave = fullReply.trim() || (streamError !== null ? FALLBACK_ERROR : fullReply);
 
   const updateFields: Record<string, any> = { $inc: { promptCount: 1 } };
-  if (user.subscription !== "free") {
+  if (plan !== "free") {
     if (needsReset) {
       updateFields.$set = {
         promptCount24h: 1,
@@ -1010,7 +1124,7 @@ export async function* chatStream(
 
   const [assistantMessage, updatedUser] = await Promise.all([
     conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, input.model, generatedImageUrl),
-    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
+    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h imageCount24h"),
   ]);
   void conversationService.touchConversation(conversation.id as string);
 
@@ -1018,6 +1132,33 @@ export async function* chatStream(
 
   const promptsUsed = updatedUser?.promptCount ?? user.promptCount + 1;
   const promptsUsed24h = updatedUser?.promptCount24h ?? promptCount24h + 1;
+  const attachmentsUsed = updatedUser?.attachmentCount24h ?? (attachmentCount24h + (files ? files.length : 0));
+  const imagesUsed = didImageOp
+    ? (updatedUser?.imageCount24h ?? ((user.imageCount24h ?? 0) + 1))
+    : (user.imageCount24h ?? 0);
+
+  // Build full usage object
+  const promptLimit = getPromptLimit(plan);
+  const attachmentLimit = getAttachmentLimit(plan);
+  const imageLimit = getImageLimit(plan);
+
+  const fullUsage = {
+    prompts: {
+      used: plan === "free" ? promptsUsed : promptsUsed24h,
+      limit: promptLimit,
+      unlimited: promptLimit === null,
+    },
+    attachments: {
+      used: attachmentsUsed,
+      limit: attachmentLimit,
+      unlimited: false,
+    },
+    images: {
+      used: imagesUsed,
+      limit: imageLimit,
+      unlimited: false,
+    },
+  };
 
   // ── 5. Final SSE event ────────────────────────────────────────────────────
   if (streamError !== null) {
@@ -1048,13 +1189,12 @@ export async function* chatStream(
       imageUrl: generatedImageUrl ?? null,
       createdAt: assistantMessage.createdAt,
     },
-    usage: {
-      promptsUsed,
-      promptsUsed24h,
-      promptsLimit: limit,
-    },
+    usage: fullUsage,
   };
 
   tTotal.stop();
   console.log(`[CHAT] ${tTotal.report()}\n`);
 }
+
+
+
