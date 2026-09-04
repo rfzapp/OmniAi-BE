@@ -27,7 +27,7 @@ export async function listMessages(userId: string, conversationId: string) {
   // Run ownership check and message fetch in parallel — both are reads
   const [, messages] = await Promise.all([
     getConversationForUser(userId, conversationId),
-    Message.find({ conversationId }, { role: 1, content: 1, model: 1, imageUrl: 1, createdAt: 1 }).sort({ createdAt: 1 }),
+    Message.find({ conversationId }, { role: 1, content: 1, model: 1, imageUrl: 1, attachmentUrl: 1, attachmentName: 1, createdAt: 1 }).sort({ createdAt: 1 }),
   ]);
   return messages.map((m) => ({
     ...m.toJSON(),
@@ -42,20 +42,30 @@ export async function findOrCreateConversation(userId: string, model: string, fi
   return Conversation.create({ userId, model, title: buildTitle(firstMessage) });
 }
 
-export async function appendMessage(conversationId: string, role: MessageRole, content: string, model?: string, imageUrl?: string) {
+export async function appendMessage(
+  conversationId: string,
+  role: MessageRole,
+  content: string,
+  model?: string,
+  imageUrl?: string,
+  attachmentUrl?: string,
+  attachmentName?: string,
+) {
   return Message.create({
     conversationId,
     role,
     content: encrypt(content),
     ...(model !== undefined && { model }),
     ...(imageUrl !== undefined && { imageUrl }),
+    ...(attachmentUrl !== undefined && { attachmentUrl }),
+    ...(attachmentName !== undefined && { attachmentName }),
   });
 }
 
 export async function getRecentMessages(conversationId: string, limit: number) {
   const messages = await Message.find(
     { conversationId },
-    { role: 1, content: 1, model: 1, imageUrl: 1, createdAt: 1 },
+    { role: 1, content: 1, model: 1, imageUrl: 1, attachmentUrl: 1, attachmentName: 1, createdAt: 1 },
   ).sort({ createdAt: -1 }).limit(limit);
   return messages.reverse().map((m) => ({
     ...m.toObject(),

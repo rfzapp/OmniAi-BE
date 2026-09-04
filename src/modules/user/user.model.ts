@@ -1,6 +1,22 @@
 import { Schema, model, type HydratedDocument, type Model } from "mongoose";
 import bcrypt from "bcrypt";
-import type { AuthProvider, ImagePlan, SubscriptionPlan, UserRole } from "../../types";
+import type { AuthProvider, SubscriptionPlan, UserRole } from "../../types";
+
+// ─── Canonical subscription enum ─────────────────────────────────────────────
+// The single source of truth for plans. Legacy imagePlan-era values that may
+// still exist in old documents are normalized at the read boundary below so
+// backend logic and API responses only ever see canonical values.
+const SUBSCRIPTION_PLANS = ["free", "starter", "pro", "extreme", "ultra"] as const;
+
+const LEGACY_PLAN_MAP: Record<string, SubscriptionPlan> = {
+  standard:  "starter",
+  ultra_pro: "ultra",
+};
+
+function normalizeSubscription(value: unknown): SubscriptionPlan {
+  if (typeof value !== "string" || !value) return "free";
+  return LEGACY_PLAN_MAP[value] ?? (value as SubscriptionPlan);
+}
 
 export interface INotificationPrefs {
   emailUpdates: boolean;
@@ -42,7 +58,6 @@ export interface IUser {
   provider: AuthProvider;
   role: UserRole;
   subscription: SubscriptionPlan;
-  imagePlan: ImagePlan;
   promptCount: number;
   promptCount24h: number;
   attachmentCount24h: number;
@@ -106,13 +121,11 @@ const userSchema = new Schema<IUser, UserModel, IUserMethods>(
     },
     subscription: {
       type: String,
-      enum: ["free", "standard", "pro", "ultra_pro"],
+      enum: SUBSCRIPTION_PLANS,
       default: "free",
-    },
-    imagePlan: {
-      type: String,
-      enum: ["none", "basic", "pro", "ultra_pro"],
-      default: "none",
+      // Normalize legacy DB values ("standard" → "starter", "ultra_pro" → "ultra")
+      // on every read — document access AND toJSON output.
+      get: normalizeSubscription,
     },
     promptCount: {
       type: Number,
@@ -191,6 +204,7 @@ userSchema.methods.comparePassword = function comparePassword(candidate: string)
 
 userSchema.set("toJSON", {
   virtuals: true,
+  getters: true, // apply schema getters (subscription normalization) in API responses
   transform: (_doc, ret) => {
     delete (ret as { password?: string }).password;
     delete (ret as { __v?: number }).__v;

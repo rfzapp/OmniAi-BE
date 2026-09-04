@@ -39,6 +39,41 @@ export async function uploadImageToCloudinary(
 }
 
 /**
+ * Upload a document (PDF, DOCX, XLSX, TXT, etc.) Buffer to Cloudinary.
+ *
+ * Uses resource_type "raw" so Cloudinary stores the file as-is without
+ * any image processing. Returns the secure HTTPS URL for the file.
+ * Files are stored under "omniai/documents/" and are never auto-deleted.
+ */
+export async function uploadDocumentToCloudinary(
+  buffer: Buffer,
+  originalName: string,
+  options: { folder?: string } = {},
+): Promise<string> {
+  const folder = options.folder ?? "omniai/documents";
+
+  // Cloudinary raw uploads require a stream or data URI; we use upload_stream
+  // via a Promise wrapper so we can pass a Buffer directly.
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        resource_type: "raw",
+        use_filename: true,
+        unique_filename: true,
+        // Strip path from original name so only the filename is used
+        public_id: originalName.replace(/[^a-zA-Z0-9._-]/g, "_"),
+      },
+      (error, result) => {
+        if (error || !result) return reject(error ?? new Error("Cloudinary upload returned no result"));
+        resolve(result.secure_url);
+      },
+    );
+    uploadStream.end(buffer);
+  });
+}
+
+/**
  * Download the image at `url` and return a raw Buffer.
  * Used when we need to feed a previously-uploaded Cloudinary image
  * back into gpt-image-2's images.edit endpoint.

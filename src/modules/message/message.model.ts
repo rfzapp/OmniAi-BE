@@ -23,6 +23,17 @@ const messageSchema = new Schema(
     imageUrl: {
       type: String,
     },
+    // Persistent Cloudinary URL for non-image file attachments (PDF, DOCX, XLSX, etc.).
+    // Stored separately from imageUrl so generated images and document attachments
+    // don't share the same field and can be distinguished on the frontend.
+    attachmentUrl: {
+      type: String,
+    },
+    // Original file name of the attachment, stored so the FE can display it
+    // without needing to parse the Cloudinary URL.
+    attachmentName: {
+      type: String,
+    },
   },
   { timestamps: { createdAt: true, updatedAt: false } },
 );
