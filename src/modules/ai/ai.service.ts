@@ -3,7 +3,6 @@ import {
   getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit, getPromptCharLimit,
   isModelAccessible, getRequiredPlanForModel, capitalizePlan, normalizePlan,
 } from "../../config/plans";
-import { getPromptLimit, getAttachmentLimit, getPromptCharLimit, canGenerateImages, getImageLimit } from "../../config/plans";
 import { User } from "../user/user.model";
 import { Message } from "../message/message.model";
 import * as conversationService from "../conversation/conversation.service";
@@ -857,7 +856,6 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     intent = await classifyImageIntent(input.message, hasPrevImage);
   }
 
-  console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent} hasAttachedImages=${hasAttachedImages}`);
   console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
 
   const wantsImage = intent === "NEW_IMAGE";
@@ -868,8 +866,6 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const attachedImageUrl = imageParts[0]?.image_url.url ?? null;
   const previousImageUrl = wantsModification
     ? (attachedImageUrl ?? (input.conversationId ? await findPreviousGeneratedImage(input.conversationId) : null))
-  const previousImageUrl = wantsModification && input.conversationId
-    ? await findPreviousGeneratedImage(input.conversationId)
     : null;
 
   const isModification = wantsModification && previousImageUrl !== null;
@@ -895,18 +891,12 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   // Upload non-image document to Cloudinary so it can be shown on reload
   const docAttachment = await buildDocumentAttachment(files);
 
-  const provider = getProvider(input.model);
-
   // Append clean user message to DB first, then fetch history for AI context
   await conversationService.appendMessage(
     conversation.id as string, "user", dbUserMessage, input.model,
     userImageUrl, docAttachment?.url, docAttachment?.name,
   );
   const provider = getProvider(input.model);
-
-  const provider = getProvider(input.model);
-
-  await conversationService.appendMessage(conversation.id as string, "user", dbUserMessage, input.model, userImageUrl);
   const history = isImageOp
     ? []
     : await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
@@ -976,10 +966,8 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   }
 
   const [assistantMessage, updatedUser] = await Promise.all([
-    conversationService.appendMessage(conversation.id as string, "assistant", replyText, input.model, imageUrl),
-    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h imageCount24h"),
     conversationService.appendMessage(conversation.id as string, "assistant", replyText, responseModel, imageUrl),
-    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
+    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h imageCount24h"),
   ]);
 
   // Touch conversation timestamp — not in critical path, fire-and-forget

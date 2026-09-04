@@ -46,10 +46,9 @@ export async function listMessages(userId: string, conversationId: string, limit
   // Run ownership check and message fetch in parallel
   const [, messages] = await Promise.all([
     getConversationForUser(userId, conversationId),
-    Message.find({ conversationId }, { role: 1, content: 1, model: 1, imageUrl: 1, attachmentUrl: 1, attachmentName: 1, createdAt: 1 }).sort({ createdAt: 1 }),
     Message.find(
       query,
-      { role: 1, content: 1, model: 1, imageUrl: 1, originalImageUrl: 1, createdAt: 1 }
+      { role: 1, content: 1, model: 1, imageUrl: 1, originalImageUrl: 1, attachmentUrl: 1, attachmentName: 1, createdAt: 1 }
     )
       .sort({ createdAt: before ? -1 : 1 })
       .limit(limit)

@@ -32,6 +32,8 @@ const messageSchema = new Schema(
     // Original file name of the attachment, stored so the FE can display it
     // without needing to parse the Cloudinary URL.
     attachmentName: {
+      type: String,
+    },
     originalImageUrl: {
       type: String,
     },
