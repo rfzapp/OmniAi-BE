@@ -13,12 +13,26 @@ import type { SubscriptionPlan } from "../types";
 const FREE_MODELS = [
   "gpt-5.6-luna",
   "claude-haiku-4-5",
+  "claude-haiku-4-5-20251001",
   "kimi-k3",
+];
+
+const PAID_IMAGE_MODELS = [
+  "gpt-image-2",
+  "gpt-image-2-low",
+  "gpt-image-2-medium",
+  "gpt-image-2-high",
+  "qwen-image-3.0",
+  "qwen-image-3.0-pro",
+  "qwen-image-plus",
+  "wan2.7-image",
+  "wan2.7-image-pro",
 ];
 
 /** Starter ($25): cheapest/fastest model from every provider */
 const STARTER_MODELS = [
   ...FREE_MODELS,
+  ...PAID_IMAGE_MODELS,
   "gpt-5.6-sol",
   "deepseek-chat",
   "grok-3",
@@ -67,12 +81,14 @@ const PLAN_ORDER: SubscriptionPlan[] = ["free", "starter", "pro", "extreme", "ul
 
 /** Check if a model is accessible for the given subscription plan. */
 export function isModelAccessible(modelId: string, plan: SubscriptionPlan): boolean {
+  if (PAID_IMAGE_MODELS.includes(modelId)) return plan !== "free";
   const allowed = MODEL_ACCESS_BY_PLAN[plan] ?? MODEL_ACCESS_BY_PLAN.free;
   return allowed.includes(modelId);
 }
 
 /** Returns the minimum plan required to unlock a model, or null if free. */
 export function getRequiredPlanForModel(modelId: string): SubscriptionPlan | null {
+  if (PAID_IMAGE_MODELS.includes(modelId)) return "starter";
   for (const plan of PLAN_ORDER) {
     if (MODEL_ACCESS_BY_PLAN[plan].includes(modelId)) return plan;
   }

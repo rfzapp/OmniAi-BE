@@ -132,6 +132,13 @@ export async function pinConversation(userId: string, conversationId: string, is
   return conversation;
 }
 
+export async function renameConversation(userId: string, conversationId: string, title: string) {
+  const conversation = await getConversationForUser(userId, conversationId);
+  conversation.title = title.trim();
+  await conversation.save();
+  return conversation;
+}
+
 export async function shareConversation(userId: string, conversationId: string) {
   const conversation = await getConversationForUser(userId, conversationId);
   if (conversation.shareToken) return conversation; // already shared

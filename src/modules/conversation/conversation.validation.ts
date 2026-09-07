@@ -7,3 +7,7 @@ export const conversationIdParamSchema = z.object({
 export const pinConversationBodySchema = z.object({
   isPinned: z.boolean(),
 });
+
+export const renameConversationBodySchema = z.object({
+  title: z.string().trim().min(1, "Title is required").max(60, "Title must be 60 characters or fewer"),
+});

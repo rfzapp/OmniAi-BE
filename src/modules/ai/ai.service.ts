@@ -20,7 +20,7 @@ import { uploadImageToCloudinary, downloadImageFromCloudinary, uploadDocumentToC
 import { toFile } from "openai/core/uploads";
 import type { AIStreamChunk } from "./providers/provider.types";
 
-import { supportsVision } from "../../config/capabilities";
+import { supportsImageEditing, supportsVision } from "../../config/capabilities";
 import type { ChatInput } from "./ai.validation";
 import type { ProviderChatMessage } from "./providers/provider.types";
 import { LatencyTimer } from "../../utils/latencyTimer";
@@ -37,8 +37,9 @@ const WAN_IMAGE_MODELS = {
   medium: "wan2.7-image",
   high: "wan2.7-image-pro",
 } as const;
-const QWEN_IMAGE_POLL_INTERVAL_MS = 2_000;
-const QWEN_IMAGE_MAX_POLLS = 90;
+const QWEN_IMAGE_POLL_INTERVAL_MS = 5_000;
+const QWEN_IMAGE_MAX_POLLS = 36;
+const IMAGE_PROVIDER_REQUEST_TIMEOUT_MS = 30_000;
 
 type ImageQuality = "low" | "medium" | "high";
 type ImageProvider = "openai" | "qwen" | "wan";
@@ -56,6 +57,13 @@ function resolveImageProvider(model?: string): ImageProvider {
   if (value.startsWith("qwen") || value.includes("qwen")) return "qwen";
   if (value.startsWith("wan") || value.includes("wan")) return "wan";
   return "openai";
+}
+
+function isImageGenerationModel(model?: string): boolean {
+  const value = (model ?? "").toLowerCase();
+  return value.startsWith("gpt-image-")
+    || value.startsWith("qwen-image-")
+    || value.startsWith("wan2.7-image");
 }
 
 function resolveImageGenerationModel(
@@ -148,6 +156,11 @@ function getProvider(model: string) {
   if (model.startsWith("mistral-") || model.startsWith("codestral-")) return mistralProvider;
   if (model.startsWith("moonshot-") || model.startsWith("kimi-")) return kimiProvider;
   return openaiProvider;
+}
+
+function hasExplicitVisualIntent(message: string): boolean {
+  return /\b(give|show|generate|create|make|draw|design|render|produce)\b.{0,60}\b(visuals?|images?|pictures?|photos?|illustrations?|artwork|mockups?|screenshots?)\b/i.test(message)
+    || /\b(visuals?|images?|pictures?|photos?|illustrations?|artwork|mockups?|screenshots?)\b.{0,30}\b(for|of|showing|depicting)\b/i.test(message);
 }
 
 /**
@@ -277,7 +290,7 @@ async function extractAttachmentContext(files: Express.Multer.File[] | undefined
       console.log(`[ATTACHMENT] name=${name} mime=${mime} size=${file.size} isImage=${isImage} model=${model}`);
 
       if (isImage) {
-        if (!supportsVision(model)) {
+        if (!supportsVision(model) && !supportsImageEditing(model)) {
           throw ApiError.badRequest("This model does not support image attachments. Please select a vision-capable model.");
         }
         return null; // vision models handle images via buildImageContentParts
@@ -625,14 +638,18 @@ async function generateImage(
     const baseUrl = env.QWEN_API_BASE_URL.replace(/\/$/, "");
 
     async function qwenRequest(url: string, init?: RequestInit): Promise<any> {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), IMAGE_PROVIDER_REQUEST_TIMEOUT_MS);
       const response = await fetch(url, {
         ...init,
+        signal: controller.signal,
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
           ...(init?.headers ?? {}),
         },
       });
+      clearTimeout(timeout);
       const responseText = await response.text();
       let body: any = {};
       try {
@@ -649,8 +666,9 @@ async function generateImage(
     }
 
     try {
-      const isQwenImage30 = requestConfig.model === "qwen-image-3.0" || requestConfig.model === "qwen-image-3.0-pro";
-      if (isQwenImage30) {
+      const usesQwenMultimodalImageApi = requestConfig.model === "qwen-image-3.0"
+        || requestConfig.model === "qwen-image-3.0-pro";
+      if (usesQwenMultimodalImageApi) {
         const response = await qwenRequest(`${baseUrl}/services/aigc/multimodal-generation/generation`, {
           method: "POST",
           body: JSON.stringify({
@@ -690,6 +708,9 @@ async function generateImage(
         await new Promise((resolve) => setTimeout(resolve, QWEN_IMAGE_POLL_INTERVAL_MS));
         const result = await qwenRequest(`${baseUrl}/tasks/${taskId}`);
         const output = result.output ?? {};
+        if (poll === 0 || (poll + 1) % 6 === 0) {
+          console.log(`[QWEN IMAGE] task=${taskId} status=${output.task_status ?? "UNKNOWN"} poll=${poll + 1}/${QWEN_IMAGE_MAX_POLLS}`);
+        }
         if (output.task_status === "FAILED" || output.task_status === "CANCELED") {
           throw new Error(result.message || `Qwen image task ${output.task_status.toLowerCase()}`);
         }
@@ -724,7 +745,7 @@ async function generateImage(
       size: requestConfig.size,
       quality: requestConfig.quality,
       response_format: "b64_json",
-    });
+    }, { timeout: IMAGE_PROVIDER_REQUEST_TIMEOUT_MS });
   } catch (err: any) {
     try {
       response = await client.images.generate({
@@ -733,7 +754,7 @@ async function generateImage(
         n: 1,
         size: requestConfig.size,
         quality: requestConfig.quality,
-      });
+      }, { timeout: IMAGE_PROVIDER_REQUEST_TIMEOUT_MS });
     } catch (err2: any) {
       console.error("[IMAGE GENERATION ERROR]", err2?.message || err2);
       throw imageProviderError("generation", err2);
@@ -841,15 +862,17 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   // IMAGE_MODIFICATION and route to editImage().
   // We still run the classifier (with hasPreviousImage=true for attached images)
   // so "describe this image" correctly stays as NORMAL_CHAT/IMAGE_ANALYSIS.
-  let intent = "NORMAL_CHAT";
+  let intent = hasAttachedImages && isImageGenerationModel(input.model)
+    ? "IMAGE_MODIFICATION"
+    : hasExplicitVisualIntent(input.message) ? "NEW_IMAGE" : "NORMAL_CHAT";
 
-  if (hasAttachedImages) {
+  if (intent === "NORMAL_CHAT" && hasAttachedImages) {
     // Attached image acts as the reference — always treat as hasPreviousImage=true
     intent = await classifyImageIntent(input.message, true);
     // If the classifier didn't detect a modification request, fall back to
     // vision analysis (the original behaviour for "describe this image" etc.)
     if (intent === "NORMAL_CHAT") intent = "IMAGE_ANALYSIS";
-  } else {
+  } else if (intent === "NORMAL_CHAT") {
     const hasPrevImage = input.conversationId
       ? (await findPreviousGeneratedImage(input.conversationId)) !== null
       : false;
@@ -896,14 +919,15 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     conversation.id as string, "user", dbUserMessage, input.model,
     userImageUrl, docAttachment?.url, docAttachment?.name,
   );
-  const provider = getProvider(input.model);
   const history = isImageOp
     ? []
     : await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
 
   let replyText: string;
   let imageUrl: string | undefined;
-  let responseModel = input.model;
+  const chatModel = isImageGenerationModel(input.model) ? "gpt-5.6-sol" : input.model;
+  const provider = getProvider(isImageOp ? input.model : chatModel);
+  let responseModel = isImageOp ? input.model : chatModel;
 
   if (isModification && previousImageUrl) {
     imageUrl = await editGeneratedImage(previousImageUrl, input.message, input.model, normalizeImageProvider(input.provider));
@@ -934,7 +958,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
           : [...imageParts];
       }
     }
-    replyText = await provider.generateReply(input.model, providerMessages);
+    replyText = await provider.generateReply(chatModel, providerMessages);
   }
 
   // Append assistant reply + update user counters in parallel; touch conversation fire-and-forget
@@ -1128,7 +1152,7 @@ export async function* chatStream(
   let streamError: string | null = null;
   // Hoisted outside try so the image-counter update block can see it after the stream ends.
   let didImageOp = false;
-  let responseModel = input.model;
+  let responseModel = isImageGenerationModel(input.model) ? "gpt-5.6-sol" : input.model;
 
   try {
     // Wait for attachment extraction (may already be done).
@@ -1146,7 +1170,8 @@ export async function* chatStream(
     const userImageUrl = imageParts[0]?.image_url.url;
     // Upload non-image document to Cloudinary so it can be shown on reload
     const docAttachment = await buildDocumentAttachment(files);
-    const provider = getProvider(input.model);
+    const chatModel = isImageGenerationModel(input.model) ? "gpt-5.6-sol" : input.model;
+    const provider = getProvider(chatModel);
 
     console.log(`[CHAT] model=${input.model} imageParts=${imageParts.length} hasFiles=${(files?.length ?? 0) > 0}`);
 
@@ -1161,16 +1186,18 @@ export async function* chatStream(
     // so "describe this image" correctly stays as NORMAL_CHAT/IMAGE_ANALYSIS.
     const hasAttachedImages = imageParts.length > 0;
 
-    let intent = "NORMAL_CHAT";
+      let intent = hasAttachedImages && isImageGenerationModel(input.model)
+        ? "IMAGE_MODIFICATION"
+        : hasExplicitVisualIntent(input.message) ? "NEW_IMAGE" : "NORMAL_CHAT";
 
-    if (hasAttachedImages) {
+      if (intent === "NORMAL_CHAT" && hasAttachedImages) {
       // Attached image acts as the reference — always treat as hasPreviousImage=true
       const tClassify = Date.now();
       intent = await classifyImageIntent(input.message, true);
       console.log(`[IMAGE_EDIT] classifyImageIntent (attached): ${Date.now() - tClassify}ms`);
       // If no modification detected, fall back to vision analysis
       if (intent === "NORMAL_CHAT") intent = "IMAGE_ANALYSIS";
-    } else {
+    } else if (intent === "NORMAL_CHAT") {
       // Only run the LLM classifier when no image file is attached.
       const tHasPrev = Date.now();
       const hasPrevImage = input.conversationId
@@ -1293,7 +1320,7 @@ export async function* chatStream(
         }
       }
 
-      const providerName = ((input.model || "").split("-")[0] ?? "").toUpperCase();
+      const providerName = ((chatModel || "").split("-")[0] ?? "").toUpperCase();
       console.log(`\n[${providerName}] Request started`);
 
       const tProvider = new LatencyTimer("Provider stream");
@@ -1305,7 +1332,7 @@ export async function* chatStream(
       let firstToken = true;
 
       try {
-        for await (const chunk of provider.generateStream(input.model, providerMessages, undefined, signal)) {
+        for await (const chunk of provider.generateStream(chatModel, providerMessages, undefined, signal)) {
           if (chunk.type === "start") continue;
 
           // Provider signalled a stream-level error — capture it, yield it so
@@ -1380,8 +1407,6 @@ export async function* chatStream(
   const [assistantMessage, updatedUser] = await Promise.all([
     conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, input.model, generatedImageUrl),
     User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h imageCount24h"),
-    conversationService.appendMessage(conversation.id as string, "assistant", contentToSave, responseModel, generatedImageUrl),
-    User.findByIdAndUpdate(userId, updateFields, { new: true }).select("promptCount promptCount24h attachmentCount24h"),
   ]);
   void conversationService.touchConversation(conversation.id as string);
 
