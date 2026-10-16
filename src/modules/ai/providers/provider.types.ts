@@ -1,4 +1,5 @@
 import type { MessageRole } from "../../../types";
+import type { BillableUsage } from "../../billing/pricing";
 
 export interface ProviderContentTextPart {
   type: "text";
@@ -21,14 +22,20 @@ export interface ProviderChatMessage {
 }
 
 export interface AIStreamChunk {
-  type: "start" | "token" | "done" | "error";
+  type: "start" | "token" | "usage" | "done" | "error";
   content?: string;
   metadata?: unknown;
+  usage?: BillableUsage;
+}
+
+export interface ProviderResponse {
+  text: string;
+  usage?: BillableUsage | undefined;
 }
 
 export interface AIProvider {
-  /** Returns the full response text (non-streaming fallback). */
-  generateReply(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string): Promise<string>;
+  /** Returns the full response text and provider-reported usage. */
+  generateReply(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string): Promise<ProviderResponse>;
   /** Streams normalized tokens via async generator. */
   generateStream(model: string, messages: ProviderChatMessage[], apiKeyOverride?: string, signal?: AbortSignal): AsyncGenerator<AIStreamChunk>;
 }

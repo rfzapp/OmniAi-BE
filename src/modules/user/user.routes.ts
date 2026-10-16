@@ -2,7 +2,7 @@ import { Router } from "express";
 import { authMiddleware } from "../../middlewares/auth.middleware";
 import { validate } from "../../middlewares/validate.middleware";
 import { changePasswordSchema, updateProfileSchema } from "./user.validation";
-import { changePasswordHandler, deleteAccountHandler, updateProfileHandler, getUsageHandler } from "./user.controller";
+import { changePasswordHandler, deleteAccountHandler, updateProfileHandler, getUsageHandler, getBillingHistoryHandler } from "./user.controller";
 
 const router = Router();
 
@@ -12,5 +12,6 @@ router.put("/profile", validate({ body: updateProfileSchema }), updateProfileHan
 router.put("/change-password", validate({ body: changePasswordSchema }), changePasswordHandler);
 router.delete("/delete", deleteAccountHandler);
 router.get("/usage", getUsageHandler);
+router.get("/billing-history", getBillingHistoryHandler);
 
 export default router;

@@ -95,13 +95,22 @@ export function getRequiredPlanForModel(modelId: string): SubscriptionPlan | nul
   return "ultra"; // unknown model → highest plan
 }
 
-/** Monthly prompt limits. `null` = unlimited. */
+/** Free retains its existing lifetime message cap; paid plans use credits. */
 export const PROMPT_LIMITS: Record<SubscriptionPlan, number | null> = {
   free:    3,      // lifetime total (tracked via promptCount)
-  starter: 200,    // $25/mo
-  pro:     600,    // $49/mo
-  extreme: 1500,   // $89/mo
-  ultra:   null,   // $199/mo — unlimited
+  starter: null,
+  pro:     null,
+  extreme: null,
+  ultra:   null,
+};
+
+/** Monthly provider-cost credit allowances. Free keeps its existing lifetime message cap. */
+export const MONTHLY_CREDIT_ALLOWANCES: Record<SubscriptionPlan, number> = {
+  free: 0,
+  starter: 60_000,
+  pro: 120_000,
+  extreme: 220_000,
+  ultra: 500_000,
 };
 
 /** Per-message character limit per plan. */
@@ -126,15 +135,15 @@ export const ATTACHMENT_LIMITS: Record<SubscriptionPlan, number> = {
 };
 
 /**
- * Monthly image generation limits per plan.
+ * Daily image generation limits per plan.
  * Images are bundled — every paid plan includes image gen.
  */
 export const IMAGE_LIMITS_BY_PLAN: Record<SubscriptionPlan, number> = {
   free:    0,
-  starter: 10,   // $25/mo
-  pro:     30,   // $49/mo
-  extreme: 80,   // $89/mo
-  ultra:   200,  // $199/mo
+  starter: 5,
+  pro:     8,
+  extreme: 15,
+  ultra:   20,
 };
 
 export function getPromptLimit(plan: SubscriptionPlan): number | null {

@@ -2,6 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { getAnthropicClient } from "../../../config/anthropic";
 import { ApiError } from "../../../utils/ApiError";
 import type { AIProvider, ProviderChatMessage } from "./provider.types";
+import { normalizeAnthropicUsage } from "./provider.utils";
+import type { BillableUsage } from "../../billing/pricing";
 
 const MAX_TOKENS = 4096;
 
@@ -61,7 +63,7 @@ export const anthropicProvider: AIProvider = {
       if (!block || block.type !== "text") {
         throw ApiError.internal("Claude returned an empty response");
       }
-      return block.text;
+      return { text: block.text, usage: normalizeAnthropicUsage(response.usage) };
     } catch (err) {
       if (err instanceof ApiError) throw err;
       if (err instanceof Anthropic.APIError) {
@@ -91,7 +93,24 @@ export const anthropicProvider: AIProvider = {
         ...(system ? { system } : {}),
         messages: toAnthropicMessages(messages),
       }, { signal });
+      let usage: BillableUsage | undefined;
       for await (const event of stream) {
+        if (event.type === "message_start") {
+          usage = { ...usage, ...normalizeAnthropicUsage(event.message.usage) };
+        }
+        if (event.type === "message_delta") {
+          const deltaUsage = normalizeAnthropicUsage(event.usage);
+          if (deltaUsage) {
+            usage = {
+              ...usage,
+              ...deltaUsage,
+              ...(deltaUsage.inputTokens === undefined && usage?.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
+              ...(deltaUsage.cachedInputTokens === undefined && usage?.cachedInputTokens !== undefined ? { cachedInputTokens: usage.cachedInputTokens } : {}),
+              ...(deltaUsage.cacheWrite5mTokens === undefined && usage?.cacheWrite5mTokens !== undefined ? { cacheWrite5mTokens: usage.cacheWrite5mTokens } : {}),
+              ...(deltaUsage.cacheWrite1hTokens === undefined && usage?.cacheWrite1hTokens !== undefined ? { cacheWrite1hTokens: usage.cacheWrite1hTokens } : {}),
+            };
+          }
+        }
         if (
           event.type === "content_block_delta" &&
           event.delta.type === "text_delta"
@@ -99,6 +118,7 @@ export const anthropicProvider: AIProvider = {
           yield { type: "token" as const, content: event.delta.text };
         }
       }
+      if (usage && Object.keys(usage).length > 0) yield { type: "usage" as const, usage };
       yield { type: "done" as const };
     } catch (err: any) {
       yield { type: "error" as const, content: err?.message || String(err) };

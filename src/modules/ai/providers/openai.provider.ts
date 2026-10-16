@@ -3,6 +3,7 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import { getOpenAIClient } from "../../../config/openai";
 import { ApiError } from "../../../utils/ApiError";
 import type { AIProvider, ProviderChatMessage, ProviderContentPart } from "./provider.types";
+import { normalizeOpenAIUsage } from "./provider.utils";
 
 function toOpenAIMessages(messages: ProviderChatMessage[]): ChatCompletionMessageParam[] {
   return messages.map((m) => {
@@ -37,13 +38,14 @@ export const openaiProvider: AIProvider = {
       const completion = await client.chat.completions.create({
         model,
         messages: toOpenAIMessages(messages),
+        max_completion_tokens: 4096,
       });
 
       const text = completion.choices[0]?.message?.content;
       if (!text) {
         throw ApiError.internal("AI provider returned an empty response");
       }
-      return text;
+      return { text, usage: normalizeOpenAIUsage(completion.usage) };
     } catch (err) {
       if (err instanceof ApiError) throw err;
 
@@ -71,12 +73,17 @@ export const openaiProvider: AIProvider = {
       const stream = await client.chat.completions.create({
         model,
         messages: toOpenAIMessages(messages),
+        max_completion_tokens: 4096,
         stream: true,
+        stream_options: { include_usage: true },
       }, { signal });
+      let usage;
       for await (const chunk of stream) {
+        if (chunk.usage) usage = normalizeOpenAIUsage(chunk.usage);
         const token = chunk.choices[0]?.delta?.content;
         if (token) yield { type: "token", content: token };
       }
+      if (usage) yield { type: "usage", usage };
       yield { type: "done" };
     } catch (err: any) {
       yield { type: "error", content: err?.message || String(err) };

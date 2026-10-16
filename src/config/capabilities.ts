@@ -32,9 +32,9 @@ const MODEL_CAPABILITY_MATRIX: Record<string, ModelCapabilities> = {
   "claude-opus-5": { text: true, imageGeneration: false, imageEditing: false, vision: true },
 
   // DeepSeek
-  "deepseek-omni": { text: true, imageGeneration: false, imageEditing: false, vision: true },
-  "deepseek-chat": { text: true, imageGeneration: false, imageEditing: false, vision: true },
-  "deepseek-reasoner": { text: true, imageGeneration: false, imageEditing: false, vision: true },
+  "deepseek-omni": { text: true, imageGeneration: false, imageEditing: false, vision: false },
+  "deepseek-chat": { text: true, imageGeneration: false, imageEditing: false, vision: false },
+  "deepseek-reasoner": { text: true, imageGeneration: false, imageEditing: false, vision: false },
 
   // xAI Grok
   "grok-omni": { text: true, imageGeneration: false, imageEditing: false, vision: true },

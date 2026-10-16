@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { ApiError } from "../../utils/ApiError";
 import {
   getPromptLimit, canGenerateImages, getAttachmentLimit, getImageLimit, getPromptCharLimit,
@@ -9,7 +10,8 @@ import * as conversationService from "../conversation/conversation.service";
 import { openaiProvider } from "./providers/openai.provider";
 import { anthropicProvider } from "./providers/anthropic.provider";
 import { groqProvider } from "./providers/groq.provider";
-import { deepseekProvider } from "./providers/deepseek.provider";
+import { openRouterProvider } from "./providers/openrouter.provider";
+import { resolveDeepSeekOpenRouterRoute } from "./providers/deepseek-openrouter.routes";
 import { qwenProvider } from "./providers/qwen.provider";
 import { mistralProvider } from "./providers/mistral.provider";
 import { kimiProvider } from "./providers/kimi.provider";
@@ -24,6 +26,19 @@ import { supportsImageEditing, supportsVision } from "../../config/capabilities"
 import type { ChatInput } from "./ai.validation";
 import type { ProviderChatMessage } from "./providers/provider.types";
 import { LatencyTimer } from "../../utils/latencyTimer";
+import {
+  estimateRequestCredits,
+  getCreditSummary,
+  getDailyImageSummary,
+  markUsageUnpriced,
+  refundCredits,
+  reserveImageQuota,
+  reserveCredits,
+  settleImageQuota,
+  settleCredits,
+} from "../billing/credit.service";
+import type { BillableUsage } from "../billing/pricing";
+import { normalizeOpenAIUsage } from "./providers/provider.utils";
 
 const HISTORY_LIMIT = 20;
 const OPENAI_IMAGE_MODEL = "gpt-image-2";
@@ -43,6 +58,12 @@ const IMAGE_PROVIDER_REQUEST_TIMEOUT_MS = 30_000;
 
 type ImageQuality = "low" | "medium" | "high";
 type ImageProvider = "openai" | "qwen" | "wan";
+interface ImageResult {
+  url: string;
+  modelId: string;
+  usage?: BillableUsage | undefined;
+  outputImages: number;
+}
 
 function normalizeImageProvider(value?: string): ImageProvider | undefined {
   const normalized = (value ?? "").toLowerCase().trim();
@@ -147,15 +168,107 @@ function imageProviderError(operation: "generation" | "edit", err: any): ApiErro
   return new ApiError(502, `Image ${operation} provider failed: ${message}`);
 }
 
+function estimateInputTokens(messages: ProviderChatMessage[]): number {
+  let textBytes = 0;
+  let imageCount = 0;
+  for (const message of messages) {
+    if (typeof message.content === "string") {
+      textBytes += Buffer.byteLength(message.content, "utf8");
+      continue;
+    }
+    for (const part of message.content) {
+      if (part.type === "text") textBytes += Buffer.byteLength(part.text, "utf8");
+      else imageCount++;
+    }
+  }
+  return Math.max(1, textBytes + imageCount * 100_000);
+}
+
+function estimateImageUsage(modelId: string, prompt: string, quality: ImageQuality, editing: boolean): BillableUsage {
+  if (modelId === OPENAI_IMAGE_MODEL) {
+    return {
+      inputTokens: Math.ceil(prompt.length / 4),
+      imageInputTokens: editing ? 12_000 : 0,
+      outputTokens: 20_000,
+      imageOutputTokens: 20_000,
+    };
+  }
+  return {
+    ...(editing ? { inputImages: 1 } : {}),
+    generatedImages: 1,
+    imageQuality: quality,
+  };
+}
+
+async function runBillableImage(
+  userId: string,
+  requestId: string,
+  modelId: string,
+  operation: "image-generation" | "image-edit",
+  prompt: string,
+  quality: ImageQuality,
+  editing: boolean,
+  action: () => Promise<ImageResult>,
+): Promise<ImageResult> {
+  const estimatedCredits = estimateRequestCredits(modelId, estimateImageUsage(modelId, prompt, quality, editing));
+  let creditReserved = false;
+  let imageReservation: Awaited<ReturnType<typeof reserveImageQuota>> | undefined;
+  try {
+    await reserveCredits({ userId, requestId, modelId, operation, estimatedCredits, imageQuality: quality });
+    creditReserved = true;
+    imageReservation = await reserveImageQuota(userId, requestId, 1);
+  } catch (error) {
+    if (creditReserved) await refundCredits(userId, requestId, "image-quota-reservation-failed").catch(() => {});
+    throw error;
+  }
+
+  let result: ImageResult;
+  try {
+    result = await action();
+  } catch (error) {
+    await refundCredits(userId, requestId, "image-provider-failure", imageReservation.date).catch(() => {});
+    throw error;
+  }
+
+  if (result.usage) {
+    try {
+      await settleCredits(userId, requestId, result.usage);
+    } catch (error) {
+      await markUsageUnpriced(userId, requestId, error instanceof Error ? error.name : "settlement-failure");
+    }
+  } else {
+    await markUsageUnpriced(userId, requestId, "image-provider-usage-missing");
+  }
+  await settleImageQuota(userId, requestId, result.outputImages, imageReservation.date).catch((error) => {
+    console.error("[billing] Failed to settle daily image quota", error instanceof Error ? error.message : "unknown error");
+  });
+  return result;
+}
+
 /** Pick the right provider based on the model ID prefix. */
 function getProvider(model: string) {
-  if (model.startsWith("claude-")) return anthropicProvider;
-  if (model.startsWith("grok-")) return groqProvider;
-  if (model.startsWith("deepseek-")) return deepseekProvider;
-  if (model.startsWith("qwen-") || model.startsWith("qwen3")) return qwenProvider;
-  if (model.startsWith("mistral-") || model.startsWith("codestral-")) return mistralProvider;
-  if (model.startsWith("moonshot-") || model.startsWith("kimi-")) return kimiProvider;
-  return openaiProvider;
+  if (model.startsWith("claude-")) return { provider: anthropicProvider, modelId: model };
+  if (model.startsWith("grok-")) return { provider: groqProvider, modelId: model };
+  if (model.startsWith("deepseek-")) {
+    const route = resolveDeepSeekOpenRouterRoute(model);
+    if (!route) throw ApiError.badRequest(`Unsupported DeepSeek model: ${model}`);
+    if (!route.enabled) throw new ApiError(503, `The ${route.displayName} route is currently disabled.`);
+    if (!env.OPENROUTER_API_KEY?.trim()) {
+      throw new ApiError(503, "OpenRouter is not configured. Set OPENROUTER_API_KEY in the backend environment.");
+    }
+    if (env.NODE_ENV !== "production") {
+      console.info(`Internal model ID: ${model}`);
+      console.info("Selected model: DeepSeek");
+      console.info(`Selected model display name: ${route.displayName}`);
+      console.info(`Selected provider: OpenRouter`);
+      console.info(`Resolved model ID: ${route.openRouterModelId}`);
+    }
+    return { provider: openRouterProvider, modelId: route.openRouterModelId };
+  }
+  if (model.startsWith("qwen-") || model.startsWith("qwen3")) return { provider: qwenProvider, modelId: model };
+  if (model.startsWith("mistral-") || model.startsWith("codestral-")) return { provider: mistralProvider, modelId: model };
+  if (model.startsWith("moonshot-") || model.startsWith("kimi-")) return { provider: kimiProvider, modelId: model };
+  return { provider: openaiProvider, modelId: model };
 }
 
 function hasExplicitVisualIntent(message: string): boolean {
@@ -182,6 +295,7 @@ function hasExplicitVisualIntent(message: string): boolean {
 async function classifyImageIntent(
   message: string,
   hasPreviousImage: boolean,
+  billing: { userId: string; requestId: string; enabled: boolean },
 ): Promise<"NEW_IMAGE" | "IMAGE_MODIFICATION" | "NORMAL_CHAT"> {
 const systemPrompt = `You are an intent classifier for an AI assistant that can generate and edit images.
 Given a user message, classify the intent as exactly one of these three labels:
@@ -201,8 +315,18 @@ NORMAL_CHAT  — the user is asking a question or having a normal text conversat
 Respond with ONLY the single label word: NEW_IMAGE, IMAGE_MODIFICATION, or NORMAL_CHAT. No other text.`;
 
   const userPrompt = `hasPreviousImage: ${hasPreviousImage}\nUser message: ${message.slice(0, 500)}`;
+  const intentRequestId = `intent-${createHash("sha256").update(billing.requestId).digest("hex").slice(0, 32)}`;
+  let reserved = false;
 
   try {
+    if (billing.enabled) {
+      const estimatedCredits = estimateRequestCredits("gpt-4o-mini", {
+        inputTokens: Buffer.byteLength(systemPrompt + userPrompt, "utf8"),
+        outputTokens: 10,
+      });
+      await reserveCredits({ userId: billing.userId, requestId: intentRequestId, modelId: "gpt-4o-mini", operation: "chat", estimatedCredits });
+      reserved = true;
+    }
     const client = getOpenAIClient();
     const res = await client.chat.completions.create({
       model: "gpt-4o-mini",
@@ -213,6 +337,15 @@ Respond with ONLY the single label word: NEW_IMAGE, IMAGE_MODIFICATION, or NORMA
       max_tokens: 10,
       temperature: 0,
     });
+    if (billing.enabled && res.usage) {
+      try {
+        await settleCredits(billing.userId, intentRequestId, normalizeOpenAIUsage(res.usage)!);
+      } catch (error) {
+        await markUsageUnpriced(billing.userId, intentRequestId, error instanceof Error ? error.name : "settlement-failure");
+      }
+    } else if (billing.enabled) {
+      await markUsageUnpriced(billing.userId, intentRequestId, "classifier-usage-missing");
+    }
     const label = (res.choices[0]?.message?.content ?? "").trim().toUpperCase();
     if (label === "NEW_IMAGE" || label === "IMAGE_MODIFICATION" || label === "NORMAL_CHAT") {
       return label as "NEW_IMAGE" | "IMAGE_MODIFICATION" | "NORMAL_CHAT";
@@ -221,6 +354,7 @@ Respond with ONLY the single label word: NEW_IMAGE, IMAGE_MODIFICATION, or NORMA
     console.warn(`[INTENT] Unexpected classifier label: "${label}", falling back to NORMAL_CHAT`);
     return "NORMAL_CHAT";
   } catch (err) {
+    if (reserved) await refundCredits(billing.userId, intentRequestId, "intent-classifier-failure").catch(() => {});
     console.error("[INTENT] classifyImageIntent failed, falling back to NORMAL_CHAT:", err);
     return "NORMAL_CHAT";
   }
@@ -524,7 +658,7 @@ async function editGeneratedImage(
   selectedModel?: string,
   providerOverride?: ImageProvider,
   apiKeyOverride?: string,
-): Promise<string> {
+): Promise<ImageResult> {
   const t0 = Date.now();
   console.log(`[IMAGE_EDIT] editImage START — imageRef="${previousImageRef.slice(0, 80)}" len=${previousImageRef.length}`);
 
@@ -568,7 +702,12 @@ async function editGeneratedImage(
     const imageResponse = await fetch(imageUrl);
     if (!imageResponse.ok) throw ApiError.internal(`Qwen image download failed with status ${imageResponse.status}`);
     const editedBuffer = Buffer.from(await imageResponse.arrayBuffer());
-    return uploadImageToCloudinary(editedBuffer, { folder: "omniai/generated" });
+    return {
+      url: await uploadImageToCloudinary(editedBuffer, { folder: "omniai/generated" }),
+      modelId: requestConfig.model,
+      usage: { inputImages: 1, generatedImages: 1, imageQuality: "high" },
+      outputImages: 1,
+    };
   }
   if (requestConfig.provider === "wan") {
     throw new ApiError(501, "Wan image editing is not enabled in this phase.");
@@ -620,7 +759,7 @@ async function editGeneratedImage(
   console.log(`[IMAGE_EDIT] Cloudinary upload: ${Date.now() - t5}ms — url=${cloudinaryUrl}`);
   console.log(`[IMAGE_EDIT] COMPLETE: total=${Date.now() - t0}ms`);
 
-  return cloudinaryUrl;
+  return { url: cloudinaryUrl, modelId: requestConfig.model, usage: normalizeOpenAIUsage(response.usage), outputImages: 1 };
 }
 
 async function generateImage(
@@ -629,7 +768,7 @@ async function generateImage(
   selectedModel?: string,
   providerOverride?: ImageProvider,
   apiKeyOverride?: string,
-): Promise<string> {
+): Promise<ImageResult> {
   const requestConfig = resolveImageGenerationModel(selectedModel, quality, providerOverride);
 
   if (requestConfig.provider === "qwen") {
@@ -686,7 +825,12 @@ async function generateImage(
         const imageResponse = await fetch(imageUrl);
         if (!imageResponse.ok) throw new Error(`Qwen image download failed with status ${imageResponse.status}`);
         const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-        return uploadImageToCloudinary(imageBuffer, { folder: "omniai/generated" });
+        return {
+          url: await uploadImageToCloudinary(imageBuffer, { folder: "omniai/generated" }),
+          modelId: requestConfig.model ?? QWEN_IMAGE_MODELS[quality],
+          usage: { generatedImages: 1, imageQuality: quality },
+          outputImages: 1,
+        };
       }
 
       const taskResponse = await qwenRequest(`${baseUrl}/services/aigc/text2image/image-synthesis`, {
@@ -721,7 +865,12 @@ async function generateImage(
         const imageResponse = await fetch(imageUrl);
         if (!imageResponse.ok) throw new Error(`Qwen image download failed with status ${imageResponse.status}`);
         const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
-        return uploadImageToCloudinary(imageBuffer, { folder: "omniai/generated" });
+        return {
+          url: await uploadImageToCloudinary(imageBuffer, { folder: "omniai/generated" }),
+          modelId: requestConfig.model ?? QWEN_IMAGE_MODELS[quality],
+          usage: { generatedImages: 1, imageQuality: quality },
+          outputImages: 1,
+        };
       }
       throw new Error("Qwen image generation timed out while waiting for the task result");
     } catch (err: any) {
@@ -774,17 +923,17 @@ async function generateImage(
       rawBuffer = Buffer.from(await imgRes.arrayBuffer());
     } catch (err) {
       console.error("[IMAGE] Failed to download image from OpenAI URL:", err);
-      return item.url;
+      return { url: item.url, modelId: requestConfig.model, usage: normalizeOpenAIUsage(response.usage), outputImages: 1 };
     }
   } else {
     throw ApiError.internal("Image generation returned no usable data");
   }
 
   const cloudinaryUrl = await uploadImageToCloudinary(rawBuffer, { folder: "omniai/generated" });
-  return cloudinaryUrl;
+  return { url: cloudinaryUrl, modelId: requestConfig.model, usage: normalizeOpenAIUsage(response.usage), outputImages: 1 };
 }
 
-export async function chat(userId: string, input: ChatInput, files?: Express.Multer.File[]) {
+export async function chat(userId: string, input: ChatInput, files?: Express.Multer.File[], requestId: string = randomUUID()) {
   const timer = new LatencyTimer('chat');
   timer.start();
   const user = await User.findById(userId).select("subscription promptCount promptCount24h attachmentCount24h imageCount24h lastImageResetAt lastPromptResetAt preferences.memoryEnabled memories");
@@ -828,11 +977,6 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
       throw new ApiError(403, "File attachments are not available on the Free plan. Upgrade your plan to attach files.");
     }
   } else {
-    const promptLimit = limit;
-    if (promptLimit !== null && (promptCount24h + 1) > promptLimit) {
-      throw new ApiError(403, `Monthly prompt limit reached for your ${capitalizePlan(plan)} plan (${promptLimit} prompts/month). Upgrade your plan to continue.`);
-    }
-
     const attachmentLimit = getAttachmentLimit(plan);
     const attachmentsCount = files ? files.length : 0;
     if ((attachmentCount24h + attachmentsCount) > attachmentLimit) {
@@ -868,7 +1012,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
 
   if (intent === "NORMAL_CHAT" && hasAttachedImages) {
     // Attached image acts as the reference — always treat as hasPreviousImage=true
-    intent = await classifyImageIntent(input.message, true);
+    intent = await classifyImageIntent(input.message, true, { userId, requestId, enabled: plan !== "free" });
     // If the classifier didn't detect a modification request, fall back to
     // vision analysis (the original behaviour for "describe this image" etc.)
     if (intent === "NORMAL_CHAT") intent = "IMAGE_ANALYSIS";
@@ -876,7 +1020,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     const hasPrevImage = input.conversationId
       ? (await findPreviousGeneratedImage(input.conversationId)) !== null
       : false;
-    intent = await classifyImageIntent(input.message, hasPrevImage);
+    intent = await classifyImageIntent(input.message, hasPrevImage, { userId, requestId, enabled: plan !== "free" });
   }
 
   console.log(`[INTENT] "${input.message.slice(0, 80)}" → ${intent}`);
@@ -898,17 +1042,6 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     throw new ApiError(403, "Image generation is not available on the Free plan. Upgrade your plan to generate images.");
   }
 
-  if (isImageOp) {
-    const imageLimit = getImageLimit(plan);
-    const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
-    const imageCount = (now.getTime() - lastImageReset.getTime() >= resetInterval)
-      ? 0
-      : (user.imageCount24h ?? 0);
-    if (imageCount >= imageLimit) {
-      throw new ApiError(403, `Monthly image generation limit reached for your ${capitalizePlan(plan)} plan (${imageLimit} images/month). Upgrade your plan for more.`);
-    }
-  }
-
   const userImageUrl = imageParts[0]?.image_url.url;
 
   // Upload non-image document to Cloudinary so it can be shown on reload
@@ -924,23 +1057,48 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     : await conversationService.getRecentMessages(conversation.id as string, HISTORY_LIMIT);
 
   let replyText: string;
+  let providerUsage: BillableUsage | undefined;
   let imageUrl: string | undefined;
   const chatModel = isImageGenerationModel(input.model) ? "gpt-5.6-sol" : input.model;
-  const provider = getProvider(isImageOp ? input.model : chatModel);
+  const providerRoute = isImageOp ? undefined : getProvider(chatModel);
   let responseModel = isImageOp ? input.model : chatModel;
 
   if (isModification && previousImageUrl) {
-    imageUrl = await editGeneratedImage(previousImageUrl, input.message, input.model, normalizeImageProvider(input.provider));
+    const editConfig = resolveImageEditModel(input.model, normalizeImageProvider(input.provider));
+    const result = await runBillableImage(
+      userId,
+      requestId,
+      editConfig.model,
+      "image-edit",
+      input.message,
+      "high",
+      true,
+      () => editGeneratedImage(previousImageUrl, input.message, input.model, normalizeImageProvider(input.provider)),
+    );
+    imageUrl = result.url;
     replyText = "Here is your modified image.";
   } else if (wantsImage) {
     responseModel = resolveImageResponseModel(input.model, input.imageQuality);
-    imageUrl = await generateImage(
+    const quality = input.imageQuality ?? "medium";
+    const providerOverride = normalizeImageProvider(input.provider) ?? (input.model ? resolveImageProvider(input.model) : undefined);
+    const imageConfig = resolveImageGenerationModel(input.model, quality, providerOverride);
+    const result = await runBillableImage(
+      userId,
+      requestId,
+      imageConfig.model ?? OPENAI_IMAGE_MODEL,
+      "image-generation",
+      input.message,
+      quality,
+      false,
+      () => generateImage(
       input.message,
       input.imageQuality,
       input.model,
-      normalizeImageProvider(input.provider) ?? (input.model ? resolveImageProvider(input.model) : undefined),
+      providerOverride,
       undefined,
+      ),
     );
+    imageUrl = result.url;
     replyText = "Here is your generated image.";
   } else {
     const providerMessages: ProviderChatMessage[] = history.map((m, idx) => {
@@ -958,7 +1116,32 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
           : [...imageParts];
       }
     }
-    replyText = await provider.generateReply(chatModel, providerMessages);
+    if (plan !== "free") {
+      const estimatedCredits = estimateRequestCredits(chatModel, {
+        inputTokens: estimateInputTokens(providerMessages),
+        outputTokens: 4096,
+      });
+      await reserveCredits({ userId, requestId, modelId: chatModel, operation: "chat", estimatedCredits });
+    }
+    let response;
+    try {
+      if (!providerRoute) throw ApiError.internal("Chat provider route was not resolved.");
+      response = await providerRoute.provider.generateReply(providerRoute.modelId, providerMessages);
+    } catch (error) {
+      if (plan !== "free") await refundCredits(userId, requestId, "provider-failure");
+      throw error;
+    }
+    replyText = response.text;
+    providerUsage = response.usage;
+    if (providerUsage && plan !== "free") {
+      try {
+        await settleCredits(userId, requestId, providerUsage);
+      } catch (error) {
+        await markUsageUnpriced(userId, requestId, error instanceof Error ? error.name : "settlement-failure");
+      }
+    } else if (plan !== "free") {
+      await markUsageUnpriced(userId, requestId, "provider-usage-missing");
+    }
   }
 
   // Append assistant reply + update user counters in parallel; touch conversation fire-and-forget
@@ -1008,6 +1191,10 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
   const promptLimit = getPromptLimit(plan);
   const attachmentLimit = getAttachmentLimit(plan);
   const imageLimit = getImageLimit(plan);
+  const [creditSummary, dailyImageSummary] = await Promise.all([
+    getCreditSummary(userId),
+    getDailyImageSummary(userId),
+  ]);
 
   const fullUsage = {
     prompts: {
@@ -1020,11 +1207,16 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
       limit: attachmentLimit,
       unlimited: false,
     },
-    images: {
-      used: imagesUsed,
-      limit: imageLimit,
-      unlimited: false,
+    credits: {
+      remaining: creditSummary.available,
+      reserved: creditSummary.reserved,
+      debt: creditSummary.debt,
+      used: creditSummary.usedThisPeriod,
+      allowance: creditSummary.allowance,
+      periodStartAt: creditSummary.periodStartAt,
+      periodEndAt: creditSummary.periodEndAt,
     },
+    images: dailyImageSummary,
   };
 
   const assistantPayload = {
@@ -1058,6 +1250,7 @@ export async function* chatStream(
   input: ChatInput,
   files?: Express.Multer.File[],
   signal?: AbortSignal,
+  requestId: string = randomUUID(),
 ): AsyncGenerator<import("./providers/provider.types").AIStreamChunk | { done: true; conversation: object; message: object; usage: object }> {
   const tTotal = new LatencyTimer("Total");
   tTotal.start();
@@ -1104,9 +1297,6 @@ export async function* chatStream(
     if (files && files.length > 0)
       throw new ApiError(403, "File attachments are not available on the Free plan. Upgrade your plan to attach files.");
   } else {
-    const promptLimit = limit;
-    if (promptLimit !== null && promptCount24h + 1 > promptLimit)
-      throw new ApiError(403, `Monthly prompt limit reached for your ${capitalizePlan(plan)} plan (${promptLimit} prompts/month). Upgrade your plan to continue.`);
     const attachmentLimit = getAttachmentLimit(plan);
     const attachmentsCount = files ? files.length : 0;
     if (attachmentCount24h + attachmentsCount > attachmentLimit)
@@ -1152,6 +1342,7 @@ export async function* chatStream(
   let streamError: string | null = null;
   // Hoisted outside try so the image-counter update block can see it after the stream ends.
   let didImageOp = false;
+  let streamUsage: BillableUsage | undefined;
   let responseModel = isImageGenerationModel(input.model) ? "gpt-5.6-sol" : input.model;
 
   try {
@@ -1171,7 +1362,6 @@ export async function* chatStream(
     // Upload non-image document to Cloudinary so it can be shown on reload
     const docAttachment = await buildDocumentAttachment(files);
     const chatModel = isImageGenerationModel(input.model) ? "gpt-5.6-sol" : input.model;
-    const provider = getProvider(chatModel);
 
     console.log(`[CHAT] model=${input.model} imageParts=${imageParts.length} hasFiles=${(files?.length ?? 0) > 0}`);
 
@@ -1193,7 +1383,7 @@ export async function* chatStream(
       if (intent === "NORMAL_CHAT" && hasAttachedImages) {
       // Attached image acts as the reference — always treat as hasPreviousImage=true
       const tClassify = Date.now();
-      intent = await classifyImageIntent(input.message, true);
+      intent = await classifyImageIntent(input.message, true, { userId, requestId, enabled: plan !== "free" });
       console.log(`[IMAGE_EDIT] classifyImageIntent (attached): ${Date.now() - tClassify}ms`);
       // If no modification detected, fall back to vision analysis
       if (intent === "NORMAL_CHAT") intent = "IMAGE_ANALYSIS";
@@ -1206,7 +1396,7 @@ export async function* chatStream(
       console.log(`[IMAGE_EDIT] findPreviousGeneratedImage (hasPrev check): ${Date.now() - tHasPrev}ms — hasPrevImage=${hasPrevImage}`);
 
       const tClassify = Date.now();
-      intent = await classifyImageIntent(input.message, hasPrevImage);
+      intent = await classifyImageIntent(input.message, hasPrevImage, { userId, requestId, enabled: plan !== "free" });
       console.log(`[IMAGE_EDIT] classifyImageIntent: ${Date.now() - tClassify}ms`);
     }
 
@@ -1228,19 +1418,11 @@ export async function* chatStream(
 
     const isModification = wantsModification && previousImageUrl !== null;
     const isImageOp = wantsImage || isModification;
+    const providerRoute = isImageOp ? undefined : getProvider(chatModel);
     if (isImageOp) didImageOp = true;
 
     if (isImageOp && !canGenerateImages(plan)) {
       throw new ApiError(403, "Image generation is not available on the Free plan. Upgrade your plan to generate images.");
-    }
-
-    if (isImageOp) {
-      const imageLimit = getImageLimit(plan);
-      const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
-      const imageCount = now.getTime() - lastImageReset.getTime() >= resetInterval ? 0 : (user.imageCount24h ?? 0);
-      if (imageCount >= imageLimit) {
-        throw new ApiError(403, `Monthly image generation limit reached for your ${capitalizePlan(plan)} plan (${imageLimit} images/month). Upgrade your plan for more.`);
-      }
     }
 
     // Save clean user message to DB, fetch history in parallel
@@ -1266,7 +1448,18 @@ export async function* chatStream(
     if (isModification && previousImageUrl) {
       const tEditStart = Date.now();
       console.log(`[IMAGE_EDIT] modify_image BRANCH START — prevImageUrlLen=${previousImageUrl.length}`);
-      generatedImageUrl = await editGeneratedImage(previousImageUrl, input.message, input.model, normalizeImageProvider(input.provider));
+      const editConfig = resolveImageEditModel(input.model, normalizeImageProvider(input.provider));
+      const result = await runBillableImage(
+        userId,
+        requestId,
+        editConfig.model,
+        "image-edit",
+        input.message,
+        "high",
+        true,
+        () => editGeneratedImage(previousImageUrl, input.message, input.model, normalizeImageProvider(input.provider)),
+      );
+      generatedImageUrl = result.url;
       console.log(`[IMAGE_EDIT] editImage RETURNED — took=${Date.now() - tEditStart}ms resultLen=${generatedImageUrl.length}`);
 
       fullReply = "Here is your modified image.";
@@ -1275,13 +1468,20 @@ export async function* chatStream(
     // ── Image generation path ────────────────────────────────────────────────
     } else if (wantsImage) {
       responseModel = resolveImageResponseModel(input.model, input.imageQuality);
-      generatedImageUrl = await generateImage(
+      const quality = input.imageQuality ?? "medium";
+      const providerOverride = normalizeImageProvider(input.provider) ?? (input.model ? resolveImageProvider(input.model) : undefined);
+      const imageConfig = resolveImageGenerationModel(input.model, quality, providerOverride);
+      const result = await runBillableImage(
+        userId,
+        requestId,
+        imageConfig.model ?? OPENAI_IMAGE_MODEL,
+        "image-generation",
         input.message,
-        input.imageQuality,
-        input.model,
-        normalizeImageProvider(input.provider) ?? (input.model ? resolveImageProvider(input.model) : undefined),
-        undefined,
+        quality,
+        false,
+        () => generateImage(input.message, input.imageQuality, input.model, providerOverride, undefined),
       );
+      generatedImageUrl = result.url;
       fullReply = "Here is your generated image.";
       yield { type: "token", content: fullReply } as unknown as AIStreamChunk;
     } else {
@@ -1320,8 +1520,21 @@ export async function* chatStream(
         }
       }
 
-      const providerName = ((chatModel || "").split("-")[0] ?? "").toUpperCase();
+      if (!providerRoute) throw ApiError.internal("Chat provider route was not resolved.");
+      const provider = providerRoute.provider;
+      const providerModel = providerRoute.modelId;
+      const providerName = provider === openRouterProvider
+        ? "OPENROUTER"
+        : ((chatModel || "").split("-")[0] ?? "").toUpperCase();
       console.log(`\n[${providerName}] Request started`);
+
+      if (plan !== "free") {
+        const estimatedCredits = estimateRequestCredits(chatModel, {
+          inputTokens: estimateInputTokens(providerMessages),
+          outputTokens: 4096,
+        });
+        await reserveCredits({ userId, requestId, modelId: chatModel, operation: "chat", estimatedCredits });
+      }
 
       const tProvider = new LatencyTimer("Provider stream");
       tProvider.start();
@@ -1332,8 +1545,12 @@ export async function* chatStream(
       let firstToken = true;
 
       try {
-        for await (const chunk of provider.generateStream(chatModel, providerMessages, undefined, signal)) {
+        for await (const chunk of provider.generateStream(providerModel, providerMessages, undefined, signal)) {
           if (chunk.type === "start") continue;
+          if (chunk.type === "usage") {
+            streamUsage = chunk.usage;
+            continue;
+          }
 
           // Provider signalled a stream-level error — capture it, yield it so
           // the frontend shows the message immediately, then stop consuming.
@@ -1362,6 +1579,17 @@ export async function* chatStream(
 
       tProvider.stop();
       console.log(`[${providerName}] Total: ${tProvider.elapsed()}ms\n`);
+      if (streamUsage && plan !== "free") {
+        try {
+          await settleCredits(userId, requestId, streamUsage);
+        } catch (error) {
+          await markUsageUnpriced(userId, requestId, error instanceof Error ? error.name : "settlement-failure");
+        }
+      } else if (streamError !== null && fullReply.length === 0 && plan !== "free") {
+        await refundCredits(userId, requestId, "provider-stream-failure");
+      } else if (plan !== "free") {
+        await markUsageUnpriced(userId, requestId, "provider-stream-usage-missing");
+      }
     } // end else (text streaming path)
 
   } catch (preStreamErr: any) {
@@ -1423,6 +1651,10 @@ export async function* chatStream(
   const promptLimit = getPromptLimit(plan);
   const attachmentLimit = getAttachmentLimit(plan);
   const imageLimit = getImageLimit(plan);
+  const [creditSummary, dailyImageSummary] = await Promise.all([
+    getCreditSummary(userId),
+    getDailyImageSummary(userId),
+  ]);
 
   const fullUsage = {
     prompts: {
@@ -1435,11 +1667,16 @@ export async function* chatStream(
       limit: attachmentLimit,
       unlimited: false,
     },
-    images: {
-      used: imagesUsed,
-      limit: imageLimit,
-      unlimited: false,
+    credits: {
+      remaining: creditSummary.available,
+      reserved: creditSummary.reserved,
+      debt: creditSummary.debt,
+      used: creditSummary.usedThisPeriod,
+      allowance: creditSummary.allowance,
+      periodStartAt: creditSummary.periodStartAt,
+      periodEndAt: creditSummary.periodEndAt,
     },
+    images: dailyImageSummary,
   };
 
   // ── 5. Final SSE event ────────────────────────────────────────────────────
@@ -1479,7 +1716,7 @@ export async function* chatStream(
 }
 
 
-export async function editImage(
+async function performEditImage(
   userId: string,
   imageInput: Buffer | string,
   prompt: string,
@@ -1489,7 +1726,7 @@ export async function editImage(
   apiKeyOverride?: string,
   conversationId?: string,
   messageId?: string,
-): Promise<string> {
+): Promise<ImageResult> {
   const user = await User.findById(userId).select("subscription imagePlan imageCount24h lastImageResetAt");
   if (!user) throw ApiError.unauthorized("User no longer exists");
 
@@ -1565,7 +1802,12 @@ export async function editImage(
         (content: { image?: string }) => content.image,
       )?.image;
       if (!imageUrl) throw new Error("Qwen image edit returned no image URL");
-      return persistEditedImage(imageUrl);
+      return {
+        url: await persistEditedImage(imageUrl),
+        modelId: requestConfig.model,
+        usage: { inputImages: 1, generatedImages: 1, imageQuality: "high" },
+        outputImages: 1,
+      };
     } catch (err: any) {
       console.error("[QWEN IMAGE EDIT ERROR]", err?.message || err);
       throw imageProviderError("edit", err);
@@ -1629,7 +1871,12 @@ export async function editImage(
   if (!item) throw ApiError.internal("Image edit returned no result");
 
   if (item.b64_json) {
-    return persistEditedImage(`data:image/png;base64,${item.b64_json}`);
+    return {
+      url: await persistEditedImage(`data:image/png;base64,${item.b64_json}`),
+      modelId: requestConfig.model,
+      usage: normalizeOpenAIUsage(response.usage),
+      outputImages: 1,
+    };
   }
 
   if (item.url) {
@@ -1638,12 +1885,57 @@ export async function editImage(
       const arrayBuffer = await imgRes.arrayBuffer();
       const base64 = Buffer.from(arrayBuffer).toString("base64");
       const contentType = imgRes.headers.get("content-type") || "image/png";
-      return `data:${contentType};base64,${base64}`;
+      return {
+        url: `data:${contentType};base64,${base64}`,
+        modelId: requestConfig.model,
+        usage: normalizeOpenAIUsage(response.usage),
+        outputImages: 1,
+      };
     } catch (err) {
-      return persistEditedImage(item.url);
+      return {
+        url: await persistEditedImage(item.url),
+        modelId: requestConfig.model,
+        usage: normalizeOpenAIUsage(response.usage),
+        outputImages: 1,
+      };
     }
   }
 
   throw ApiError.internal("Image edit returned no usable image data");
 }
 
+export async function editImage(
+  userId: string,
+  imageInput: Buffer | string,
+  prompt: string,
+  maskInput?: Buffer | string,
+  model?: string,
+  providerOverride?: ImageProvider,
+  apiKeyOverride?: string,
+  conversationId?: string,
+  messageId?: string,
+  requestId: string = randomUUID(),
+): Promise<string> {
+  const requestConfig = resolveImageEditModel(model, providerOverride);
+  const result = await runBillableImage(
+    userId,
+    requestId,
+    requestConfig.model,
+    "image-edit",
+    prompt,
+    "high",
+    true,
+    () => performEditImage(
+      userId,
+      imageInput,
+      prompt,
+      maskInput,
+      model,
+      providerOverride,
+      apiKeyOverride,
+      conversationId,
+      messageId,
+    ),
+  );
+  return result.url;
+}

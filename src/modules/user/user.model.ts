@@ -58,6 +58,14 @@ export interface IUser {
   provider: AuthProvider;
   role: UserRole;
   subscription: SubscriptionPlan;
+  creditsAvailable: number;
+  creditsReserved: number;
+  creditsDebt: number;
+  creditsUsedThisPeriod: number;
+  monthlyCreditAllowance: number;
+  creditPeriodStartAt: Date | null;
+  creditPeriodEndAt: Date | null;
+  creditReservations: Record<string, { credits: number; status: string }>;
   promptCount: number;
   promptCount24h: number;
   attachmentCount24h: number;
@@ -127,6 +135,14 @@ const userSchema = new Schema<IUser, UserModel, IUserMethods>(
       // on every read — document access AND toJSON output.
       get: normalizeSubscription,
     },
+    creditsAvailable: { type: Number, default: 0, min: 0 },
+    creditsReserved: { type: Number, default: 0, min: 0 },
+    creditsDebt: { type: Number, default: 0, min: 0 },
+    creditsUsedThisPeriod: { type: Number, default: 0, min: 0 },
+    monthlyCreditAllowance: { type: Number, default: 0, min: 0 },
+    creditPeriodStartAt: { type: Date, default: null },
+    creditPeriodEndAt: { type: Date, default: null },
+    creditReservations: { type: Schema.Types.Mixed, default: {} },
     promptCount: {
       type: Number,
       default: 0,
@@ -207,6 +223,7 @@ userSchema.set("toJSON", {
   getters: true, // apply schema getters (subscription normalization) in API responses
   transform: (_doc, ret) => {
     delete (ret as { password?: string }).password;
+    delete (ret as { creditReservations?: unknown }).creditReservations;
     delete (ret as { __v?: number }).__v;
     delete (ret as { _id?: unknown })._id;
     if (Array.isArray(ret.memories)) {

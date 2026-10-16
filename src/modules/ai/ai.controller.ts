@@ -1,13 +1,24 @@
 import type { Request, Response } from "express";
+import { randomUUID } from "node:crypto";
 import { sendSuccess } from "../../utils/ApiResponse";
 import { ApiError } from "../../utils/ApiError";
 import * as aiService from "./ai.service";
+
+function getRequestId(req: Request): string {
+  const key = req.header("idempotency-key") ?? req.header("x-request-id");
+  return key && /^[A-Za-z0-9_-]{8,100}$/.test(key) ? key : randomUUID();
+}
 
 export async function chatHandler(req: Request, res: Response) {
   if (!req.user) throw ApiError.unauthorized();
 
   const files = Array.isArray(req.files) ? req.files : [];
-  const { conversation, message, imageUrl, usage } = await aiService.chat(req.user.id, req.body, files as Express.Multer.File[]);
+  const { conversation, message, imageUrl, usage } = await aiService.chat(
+    req.user.id,
+    req.body,
+    files as Express.Multer.File[],
+    getRequestId(req),
+  );
 
   sendSuccess(res, 200, "AI response generated successfully", {
     conversation: {
@@ -109,7 +120,7 @@ export async function chatStreamHandler(req: Request, res: Response) {
   }, 3000);
 
   try {
-    const generator = aiService.chatStream(req.user.id, req.body, files, abortController.signal);
+    const generator = aiService.chatStream(req.user.id, req.body, files, abortController.signal, getRequestId(req));
 
     // Consume the entire generator to ensure the persist step always runs,
     // even if the client disconnected mid-stream.
@@ -158,6 +169,7 @@ export async function editImageHandler(req: Request, res: Response) {
     undefined,
     conversationId,
     messageId,
+    getRequestId(req),
   );
 
   sendSuccess(res, 200, "Image edited successfully", {

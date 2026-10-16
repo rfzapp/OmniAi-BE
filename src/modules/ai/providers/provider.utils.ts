@@ -1,6 +1,49 @@
 import OpenAI from "openai";
 import { ApiError } from "../../../utils/ApiError";
 import type { ProviderChatMessage } from "./provider.types";
+import type { BillableUsage } from "../../billing/pricing";
+
+function numeric(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+export function normalizeOpenAIUsage(usage: any): BillableUsage | undefined {
+  if (!usage) return undefined;
+  const inputTokens = numeric(usage.prompt_tokens ?? usage.input_tokens);
+  const outputTokens = numeric(usage.completion_tokens ?? usage.output_tokens);
+  if (inputTokens === undefined && outputTokens === undefined) return undefined;
+  const inputDetails = usage.prompt_tokens_details ?? usage.input_tokens_details ?? {};
+  const outputDetails = usage.completion_tokens_details ?? usage.output_tokens_details ?? {};
+  const cachedInputTokens = numeric(inputDetails.cached_tokens);
+  const imageInputTokens = numeric(inputDetails.image_tokens);
+  const imageOutputTokens = numeric(outputDetails.image_tokens);
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(imageInputTokens !== undefined ? { imageInputTokens } : {}),
+    ...(imageOutputTokens !== undefined ? { imageOutputTokens } : {}),
+  };
+}
+
+export function normalizeAnthropicUsage(usage: any): BillableUsage | undefined {
+  if (!usage) return undefined;
+  const cacheCreation = usage.cache_creation ?? {};
+  const cacheWrite5mTokens = numeric(cacheCreation.ephemeral_5m_input_tokens);
+  const cacheWrite1hTokens = numeric(cacheCreation.ephemeral_1h_input_tokens);
+  const cachedInputTokens = numeric(usage.cache_read_input_tokens);
+  const uncachedInputTokens = numeric(usage.input_tokens);
+  const outputTokens = numeric(usage.output_tokens);
+  const inputTokens = (uncachedInputTokens ?? 0) + (cachedInputTokens ?? 0) + (cacheWrite5mTokens ?? 0) + (cacheWrite1hTokens ?? 0);
+  if (uncachedInputTokens === undefined && outputTokens === undefined && cachedInputTokens === undefined && cacheWrite5mTokens === undefined && cacheWrite1hTokens === undefined) return undefined;
+  return {
+    ...((uncachedInputTokens !== undefined || cachedInputTokens !== undefined || cacheWrite5mTokens !== undefined || cacheWrite1hTokens !== undefined) ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(cacheWrite5mTokens !== undefined ? { cacheWrite5mTokens } : {}),
+    ...(cacheWrite1hTokens !== undefined ? { cacheWrite1hTokens } : {}),
+  };
+}
 
 /**
  * Converts a provider message content (string or parts array) to a plain text string.

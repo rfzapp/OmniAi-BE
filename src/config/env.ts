@@ -26,6 +26,9 @@ const envSchema = z.object({
   XAI_API_KEY: z.string().optional(),
 
   // Optional — only required when DeepSeek models are used
+  OPENROUTER_API_KEY: z.string().optional(),
+
+  // Legacy direct-provider key; DeepSeek model routes use OpenRouter.
   DEEPSEEK_API_KEY: z.string().optional(),
 
   // Optional — only required when Qwen models are used

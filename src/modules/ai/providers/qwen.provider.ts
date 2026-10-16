@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { env } from "../../../config/env";
 import type { AIProvider, ProviderChatMessage } from "./provider.types";
-import { toOpenAICompatMessages, handleOpenAICompatError } from "./provider.utils";
+import { toOpenAICompatMessages, handleOpenAICompatError, normalizeOpenAIUsage } from "./provider.utils";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
 function getClient(apiKeyOverride?: string): OpenAI {
@@ -56,10 +56,10 @@ export const qwenProvider: AIProvider = {
     try {
       const converted = toMessages(messages);
       logQwenRequest(converted, model);
-      const completion = await getClient(apiKeyOverride).chat.completions.create({ model, messages: converted });
+      const completion = await getClient(apiKeyOverride).chat.completions.create({ model, messages: converted, max_tokens: 4096 });
       const text = completion.choices[0]?.message?.content;
       if (!text) throw new Error("Qwen returned an empty response");
-      return text;
+      return { text, usage: normalizeOpenAIUsage(completion.usage) };
     } catch (err) {
       handleOpenAICompatError(err, "Qwen");
     }
@@ -72,15 +72,17 @@ export const qwenProvider: AIProvider = {
       logQwenRequest(converted, model);
 
       const stream = await getClient(apiKeyOverride).chat.completions.create(
-        { model, messages: converted, stream: true },
+        { model, messages: converted, max_tokens: 4096, stream: true, stream_options: { include_usage: true } },
         { signal },
       );
 
       let chunkIndex = 0;
       let tokenCount = 0;
       let lastFinishReason: string | null = null;
+      let usage;
 
       for await (const chunk of stream) {
+        if (chunk.usage) usage = normalizeOpenAIUsage(chunk.usage);
         chunkIndex++;
         const choice = chunk.choices[0];
         const delta = choice?.delta as Record<string, unknown> | undefined;
@@ -103,6 +105,7 @@ export const qwenProvider: AIProvider = {
       }
 
       console.log(`[QWEN] API response complete: chunks=${chunkIndex} tokens=${tokenCount} finishReason=${lastFinishReason}`);
+      if (usage) yield { type: "usage", usage };
 
       // Guard: if Qwen returned chunks but no content tokens, emit an error
       // instead of silently completing with an empty reply.

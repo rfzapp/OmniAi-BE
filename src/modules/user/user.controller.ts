@@ -3,9 +3,10 @@ import { sendSuccess } from "../../utils/ApiResponse";
 import { ApiError } from "../../utils/ApiError";
 import * as userService from "./user.service";
 import {
-  getPromptLimit, getAttachmentLimit, getImageLimit, getPromptCharLimit,
+  getAttachmentLimit, getPromptCharLimit,
   MODEL_ACCESS_BY_PLAN, normalizePlan,
 } from "../../config/plans";
+import { getBillingHistory, getCreditSummary, getDailyImageSummary } from "../billing/credit.service";
 
 export async function updateProfileHandler(req: Request, res: Response) {
   if (!req.user) throw ApiError.unauthorized();
@@ -34,17 +35,10 @@ export async function getUsageHandler(req: Request, res: Response) {
   const plan = normalizePlan(user.subscription as string);
   const now = new Date();
   const resetInterval = 30 * 24 * 60 * 60 * 1000; // 30-day rolling window
-
-  // Prompt usage
-  const promptLimit = getPromptLimit(plan);
-  let promptsUsed: number;
-  if (plan === "free") {
-    promptsUsed = user.promptCount ?? 0;
-  } else {
-    const lastPromptReset = user.lastPromptResetAt ? new Date(user.lastPromptResetAt) : now;
-    const needsReset = now.getTime() - lastPromptReset.getTime() >= resetInterval;
-    promptsUsed = needsReset ? 0 : (user.promptCount24h ?? 0);
-  }
+  const [credits, images] = await Promise.all([
+    getCreditSummary(req.user.id, now),
+    getDailyImageSummary(req.user.id, now),
+  ]);
 
   // Attachment usage
   const attachmentLimit = getAttachmentLimit(plan);
@@ -52,19 +46,17 @@ export async function getUsageHandler(req: Request, res: Response) {
   const attachNeedsReset = now.getTime() - lastPromptReset.getTime() >= resetInterval;
   const attachmentsUsed = plan === "free" ? 0 : (attachNeedsReset ? 0 : (user.attachmentCount24h ?? 0));
 
-  // Image usage
-  const imageLimit = getImageLimit(plan);
-  const lastImageReset = user.lastImageResetAt ? new Date(user.lastImageResetAt) : now;
-  const imageNeedsReset = now.getTime() - lastImageReset.getTime() >= resetInterval;
-  const imagesUsed = plan === "free" ? 0 : (imageNeedsReset ? 0 : (user.imageCount24h ?? 0));
-
   sendSuccess(res, 200, "Usage data fetched successfully", {
     plan,
     usage: {
-      prompts: {
-        used: promptsUsed,
-        limit: promptLimit,
-        unlimited: promptLimit === null,
+      credits: {
+        remaining: credits.available,
+        reserved: credits.reserved,
+        debt: credits.debt,
+        used: credits.usedThisPeriod,
+        allowance: credits.allowance,
+        periodStartAt: credits.periodStartAt,
+        periodEndAt: credits.periodEndAt,
       },
       attachments: {
         used: attachmentsUsed,
@@ -72,12 +64,23 @@ export async function getUsageHandler(req: Request, res: Response) {
         unlimited: false,
       },
       images: {
-        used: imagesUsed,
-        limit: imageLimit,
-        unlimited: false,
+        used: images.used,
+        reserved: images.reserved,
+        remaining: images.remaining,
+        limit: images.limit,
+        date: images.date,
+        timezone: images.timezone,
       },
     },
     charLimit: getPromptCharLimit(plan),
     modelAccess: MODEL_ACCESS_BY_PLAN[plan] ?? MODEL_ACCESS_BY_PLAN.free,
   });
+}
+
+export async function getBillingHistoryHandler(req: Request, res: Response) {
+  if (!req.user) throw ApiError.unauthorized();
+  const requestedLimit = Number(req.query.limit ?? 50);
+  const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(100, Math.floor(requestedLimit))) : 50;
+  const history = await getBillingHistory(req.user.id, limit);
+  sendSuccess(res, 200, "Billing history fetched successfully", history);
 }
