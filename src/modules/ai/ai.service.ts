@@ -39,6 +39,7 @@ import {
 } from "../billing/credit.service";
 import type { BillableUsage } from "../billing/pricing";
 import { normalizeOpenAIUsage } from "./providers/provider.utils";
+import { isImageCapabilityQuestion, mayHaveImageIntent } from "./image-intent";
 
 const HISTORY_LIMIT = 20;
 const OPENAI_IMAGE_MODEL = "gpt-image-2";
@@ -272,6 +273,7 @@ function getProvider(model: string) {
 }
 
 function hasExplicitVisualIntent(message: string): boolean {
+  if (isImageCapabilityQuestion(message)) return false;
   return /\b(give|show|generate|create|make|draw|design|render|produce)\b.{0,60}\b(visuals?|images?|pictures?|photos?|illustrations?|artwork|mockups?|screenshots?)\b/i.test(message)
     || /\b(visuals?|images?|pictures?|photos?|illustrations?|artwork|mockups?|screenshots?)\b.{0,30}\b(for|of|showing|depicting)\b/i.test(message);
 }
@@ -1016,7 +1018,7 @@ export async function chat(userId: string, input: ChatInput, files?: Express.Mul
     // If the classifier didn't detect a modification request, fall back to
     // vision analysis (the original behaviour for "describe this image" etc.)
     if (intent === "NORMAL_CHAT") intent = "IMAGE_ANALYSIS";
-  } else if (intent === "NORMAL_CHAT") {
+  } else if (intent === "NORMAL_CHAT" && !isImageCapabilityQuestion(input.message) && mayHaveImageIntent(input.message)) {
     const hasPrevImage = input.conversationId
       ? (await findPreviousGeneratedImage(input.conversationId)) !== null
       : false;
@@ -1387,8 +1389,8 @@ export async function* chatStream(
       console.log(`[IMAGE_EDIT] classifyImageIntent (attached): ${Date.now() - tClassify}ms`);
       // If no modification detected, fall back to vision analysis
       if (intent === "NORMAL_CHAT") intent = "IMAGE_ANALYSIS";
-    } else if (intent === "NORMAL_CHAT") {
-      // Only run the LLM classifier when no image file is attached.
+    } else if (intent === "NORMAL_CHAT" && !isImageCapabilityQuestion(input.message) && mayHaveImageIntent(input.message)) {
+      // Avoid the extra classifier and image-history lookup for ordinary chat.
       const tHasPrev = Date.now();
       const hasPrevImage = input.conversationId
         ? (await findPreviousGeneratedImage(input.conversationId)) !== null

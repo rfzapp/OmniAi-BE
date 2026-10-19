@@ -8,7 +8,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "type-check": "tsc --noEmit",
-    "test": "node --test -r ts-node/register src/modules/billing/*.test.ts src/modules/ai/providers/*.test.ts"
+    "test": "node --test -r ts-node/register src/modules/billing/*.test.ts src/modules/ai/*.test.ts src/modules/ai/providers/*.test.ts"
   },
   "keywords": [],
   "author": "",
